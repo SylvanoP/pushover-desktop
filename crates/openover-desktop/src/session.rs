@@ -59,12 +59,12 @@ impl Connection {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::SignedOut => "Nicht angemeldet",
-            Self::Connecting => "Verbinde…",
+            Self::SignedOut => "Abgemeldet",
+            Self::Connecting => "Verbinde",
             Self::Connected => "Verbunden",
-            Self::Reconnecting => "Verbindung unterbrochen, neuer Versuch…",
-            Self::SyncFailed => "Nachrichtenabruf fehlgeschlagen",
-            Self::SessionEnded => "Sitzung beendet",
+            Self::Reconnecting => "Unterbrochen",
+            Self::SyncFailed => "Fehler",
+            Self::SessionEnded => "Beendet",
         }
     }
 }

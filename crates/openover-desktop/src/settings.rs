@@ -93,7 +93,7 @@ impl Settings {
             messages: openover_core::load_message_log(),
             selected_id: None,
             epoch: 0,
-            status: "Noch nicht angemeldet. Das Passwort wird nicht gespeichert.".into(),
+            status: SharedString::default(),
             pending_emergency: None,
             _subscriptions: subscriptions,
         }
@@ -244,11 +244,11 @@ impl Settings {
                 self.busy = false;
                 self.logged_in = true;
                 self.connection = Connection::Connecting;
-                self.pane = Pane::Account;
+                self.pane = Pane::Messages;
                 self.show_twofa = false;
                 self.password.update(cx, |password, cx| password.clear(cx));
                 self.twofa.update(cx, |twofa, cx| twofa.emplace("", cx));
-                self.status = "Angemeldet. Das Passwort wurde aus dem Speicher gelöscht.".into();
+                self.status = SharedString::default();
             }
             SessionEvent::LoggedOut { epoch } => {
                 if !self.accept_epoch(epoch) {
@@ -259,9 +259,7 @@ impl Settings {
                 self.connection = Connection::SignedOut;
                 self.pane = Pane::Account;
                 self.pending_emergency = None;
-                self.status =
-                    "Abgemeldet. Dasselbe Konto verwendet dieses Gerät beim nächsten Login wieder."
-                        .into();
+                self.status = SharedString::default();
                 crate::tray::set_tooltip_text(cx, Connection::SignedOut.tooltip());
                 open_settings = true;
             }
@@ -345,16 +343,15 @@ impl Render for Settings {
             .is_focused(window);
         let device_name = self.device_name.read(cx).as_str().trim().to_string();
         let email = self.email.read(cx).as_str().trim().to_string();
-        let name_hint = match validate_device_name(&device_name) {
-            Ok(()) => format!("{}/25", device_name.chars().count()),
-            Err(err) => err.to_string(),
-        };
-        let logged_in = self.logged_in;
+        let name_error = validate_device_name(&device_name)
+            .err()
+            .map(|err| err.to_string());
         let button_label = if self.busy {
             "Anmeldung läuft…"
         } else {
             "Anmelden"
         };
+        let status = self.status.clone();
 
         div()
             .id("openover-settings")
@@ -371,85 +368,49 @@ impl Render for Settings {
             .size_full()
             .flex()
             .flex_col()
-            .gap(px(20.))
-            .overflow_y_scroll()
-            .p(px(24.))
             .bg(theme.surface)
             .text_sm()
             .text_color(theme.text)
+            .child(top_bar(self, &theme, cx))
             .child(
                 div()
+                    .id("openover-content")
+                    .flex_1()
+                    .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("Openover"),
-                    )
-                    .child(div().text_color(theme.quiet).child(
-                        "Inoffizieller Pushover Open Client. Passwort wird nicht gespeichert.",
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
                     .gap(px(16.))
-                    .child(
-                        tab_button("tab-account", "Konto", self.pane == Pane::Account, &theme)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.pane = Pane::Account;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        tab_button(
-                            "tab-preferences",
-                            "Einstellungen",
-                            self.pane == Pane::Preferences,
-                            &theme,
+                    .px(px(20.))
+                    .py(px(16.))
+                    .child(match self.pane {
+                        Pane::Account => account_pane(
+                            &AccountPane {
+                                settings: self,
+                                theme: &theme,
+                                email: &email,
+                                name_error: name_error.as_deref(),
+                                email_focused,
+                                twofa_focused,
+                                device_focused,
+                                button_label,
+                            },
+                            cx,
+                        ),
+                        Pane::Preferences => preferences_pane(self, &theme, &device_name, cx),
+                        Pane::Messages => messages_pane(self, &theme, cx),
+                    })
+                    .when_some(self.pending_emergency.clone(), |form, (_, title)| {
+                        form.child(emergency_card(title, &theme, cx))
+                    })
+                    .when(!status.is_empty(), |form| {
+                        form.child(
+                            div()
+                                .text_color(theme.quiet)
+                                .whitespace_normal()
+                                .child(status),
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.pane = Pane::Preferences;
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        tab_button(
-                            "tab-messages",
-                            "Nachrichten",
-                            self.pane == Pane::Messages,
-                            &theme,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.reload_messages();
-                            this.pane = Pane::Messages;
-                            cx.notify();
-                        })),
-                    ),
+                    }),
             )
-            .child(match self.pane {
-                Pane::Account => account_pane(
-                    &AccountPane {
-                        settings: self,
-                        theme: &theme,
-                        email: &email,
-                        name_hint: &name_hint,
-                        email_focused,
-                        twofa_focused,
-                        device_focused,
-                        button_label,
-                    },
-                    cx,
-                ),
-                Pane::Preferences => preferences_pane(self, &theme, &device_name, cx),
-                Pane::Messages => messages_pane(self, &theme, cx),
-            })
-            .when_some(self.pending_emergency.clone(), |form, (_, title)| {
-                form.child(emergency_card(title, &theme, cx))
-            })
-            .child(footer(self.status.clone(), &theme, logged_in))
     }
 }
 
@@ -458,7 +419,7 @@ struct AccountPane<'a> {
     settings: &'a Settings,
     theme: &'a FormTheme,
     email: &'a str,
-    name_hint: &'a str,
+    name_error: Option<&'a str>,
     email_focused: bool,
     twofa_focused: bool,
     device_focused: bool,
@@ -470,7 +431,7 @@ fn account_pane(pane: &AccountPane<'_>, cx: &mut Context<Settings>) -> gpui::Div
         settings,
         theme,
         email,
-        name_hint,
+        name_error,
         email_focused,
         twofa_focused,
         device_focused,
@@ -481,24 +442,9 @@ fn account_pane(pane: &AccountPane<'_>, cx: &mut Context<Settings>) -> gpui::Div
             .flex()
             .flex_col()
             .gap(px(16.))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child("Angemeldet"),
-                    )
-                    .when(!email.is_empty(), |block| {
-                        block.child(div().child(email.to_string()))
-                    })
-                    .child(div().text_color(theme.quiet).child(
-                        "Die Sitzung bleibt auf diesem PC. Das Passwort ist nicht gespeichert.",
-                    )),
-            )
+            .when(!email.is_empty(), |block| {
+                block.child(div().child(email.to_string()))
+            })
             .child(
                 primary_button("logout", "Abmelden", theme)
                     .on_click(cx.listener(|this, _, _, cx| this.logout(cx))),
@@ -532,31 +478,24 @@ fn account_pane(pane: &AccountPane<'_>, cx: &mut Context<Settings>) -> gpui::Div
                 ),
             ))
         })
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(6.))
-                .child(labeled(
-                    "Gerätename",
-                    text_field(
-                        "device-name",
-                        settings.device_name.downgrade(),
-                        DEFAULT_DEVICE_NAME,
-                        theme,
-                        device_focused,
-                    ),
-                ))
-                .child(
-                    div()
-                        .text_color(theme.quiet)
-                        .child(format!("{name_hint} · nur A–Z, a–z, 0–9, _ und -")),
-                ),
-        )
+        .child(labeled(
+            "Gerätename",
+            text_field(
+                "device-name",
+                settings.device_name.downgrade(),
+                DEFAULT_DEVICE_NAME,
+                theme,
+                device_focused,
+            ),
+        ))
+        .when_some(name_error, |form, error| {
+            form.child(div().text_color(theme.quiet).child(error.to_string()))
+        })
         .child(
             primary_button("login", button_label, theme)
                 .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
         )
+        .child(account_links(theme))
 }
 
 fn preferences_pane(
@@ -575,42 +514,35 @@ fn preferences_pane(
         .flex()
         .flex_col()
         .gap(px(16.))
-        .child(labeled(
-            "Verbindung",
-            field_chrome(div(), theme, false).child(settings.connection.label()),
-        ))
-        .child(labeled(
-            "Ton",
-            field_chrome(div().id("sound-toggle"), theme, settings.sound_enabled)
-                .cursor_pointer()
-                .justify_between()
-                .child("Benachrichtigungston")
-                .child(
-                    div()
-                        .text_color(if settings.sound_enabled {
-                            theme.accent
-                        } else {
-                            theme.quiet
-                        })
-                        .child(sound_label),
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_sound(cx))),
-        ))
-        .child(labeled("Lautstärke", volume_slider(settings, theme, cx)))
         .child(
             div()
-                .text_color(theme.quiet)
-                .child("0 ist stumm, auch wenn der Ton an ist."),
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .child(
+                    field_chrome(div().id("sound-toggle"), theme, settings.sound_enabled)
+                        .w(px(140.))
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .justify_between()
+                        .child("Ton")
+                        .child(
+                            div()
+                                .text_color(if settings.sound_enabled {
+                                    theme.accent
+                                } else {
+                                    theme.quiet
+                                })
+                                .child(sound_label),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sound(cx))),
+                )
+                .child(div().flex_1().child(volume_slider(settings, theme, cx))),
         )
         .child(labeled(
             "Gerätename",
             field_chrome(div(), theme, false).child(shown_name),
         ))
-        .child(
-            div()
-                .text_color(theme.quiet)
-                .child("Der Gerätename wird beim Anmelden festgelegt."),
-        )
 }
 
 fn volume_slider(
@@ -687,39 +619,14 @@ fn volume_slider(
 }
 
 fn messages_pane(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settings>) -> gpui::Div {
-    let selected = settings.selected_id.and_then(|id| {
-        settings
-            .messages
-            .iter()
-            .find(|message| message.id == id)
-            .cloned()
-    });
-    let mut pane = div()
-        .flex()
-        .flex_col()
-        .gap(px(16.))
-        .child(message_bar(theme, cx));
     if settings.messages.is_empty() {
-        return pane.child(
-            div()
-                .text_color(theme.quiet)
-                .child("Noch keine Nachrichten."),
-        );
+        return div()
+            .text_color(theme.quiet)
+            .child("Noch keine Nachrichten.");
     }
-    pane = pane.child(message_detail(
-        selected.as_ref(),
-        settings.selected_id.is_some(),
-        theme,
-        cx,
-    ));
-    let mut list = div()
-        .id("message-list")
-        .flex()
-        .flex_col()
-        .gap(px(8.))
-        .max_h(px(280.))
-        .overflow_y_scroll();
-    for message in &settings.messages {
+    let messages = newest_first(&settings.messages);
+    let mut list = div().id("message-list").flex().flex_col();
+    for message in &messages {
         list = list.child(message_row(
             message,
             settings.selected_id == Some(message.id),
@@ -727,77 +634,28 @@ fn messages_pane(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settin
             cx,
         ));
     }
-    pane.child(list)
-}
-
-fn message_bar(theme: &FormTheme, cx: &mut Context<Settings>) -> impl IntoElement {
-    field_chrome(div(), theme, false)
-        .justify_between()
-        .child(div().text_color(theme.quiet).child("Neueste zuerst"))
-        .child(
-            div()
-                .id("clear-messages")
-                .cursor_pointer()
-                .text_color(theme.accent)
-                .child("Leeren")
-                .on_click(cx.listener(|this, _, _, cx| this.clear_messages(cx))),
-        )
-}
-
-fn message_detail(
-    message: Option<&LoggedMessage>,
-    missing: bool,
-    theme: &FormTheme,
-    _cx: &mut Context<Settings>,
-) -> gpui::Div {
-    let Some(message) = message else {
-        let hint = if missing {
-            "Diese Nachricht ist nicht mehr gespeichert."
-        } else {
-            "Eine Nachricht auswählen, um den Text zu lesen."
-        };
-        return div().text_color(theme.quiet).child(hint);
-    };
-    let url = message.url.clone();
     div()
         .flex()
         .flex_col()
         .gap(px(8.))
-        .w_full()
-        .min_h(field_height())
-        .px_3()
-        .py_2()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.field)
         .child(
-            div()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .whitespace_normal()
-                .child(message.title.clone()),
-        )
-        .child(
-            div()
-                .text_color(theme.quiet)
-                .whitespace_normal()
-                .child(message_meta(message)),
-        )
-        .child(div().whitespace_normal().child(message_body(message)))
-        .when_some(url, |detail, url| {
-            detail.child(
+            div().flex().justify_end().child(
                 div()
-                    .id("message-url")
+                    .id("clear-messages")
                     .cursor_pointer()
-                    .underline()
-                    .text_color(theme.quiet)
-                    .overflow_hidden()
-                    .child(url.clone())
-                    .on_click(move |_, _, cx| {
-                        cx.open_url(&url);
-                    }),
-            )
-        })
+                    .text_xs()
+                    .text_color(theme.accent)
+                    .child("Leeren")
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_messages(cx))),
+            ),
+        )
+        .child(list)
+}
+
+fn newest_first(messages: &[LoggedMessage]) -> Vec<LoggedMessage> {
+    let mut items = messages.to_vec();
+    items.sort_by(|left, right| right.time.cmp(&left.time).then(right.id.cmp(&left.id)));
+    items
 }
 
 fn message_row(
@@ -805,59 +663,85 @@ fn message_row(
     selected: bool,
     theme: &FormTheme,
     cx: &mut Context<Settings>,
-) -> gpui::Stateful<gpui::Div> {
+) -> gpui::Div {
     let id = message.id;
-    field_chrome(
-        div().id(SharedString::from(format!("msg-{id}"))),
-        theme,
-        selected,
-    )
-    .cursor_pointer()
-    .justify_between()
-    .gap(px(8.))
-    .on_click(cx.listener(move |this, _, _, cx| {
-        this.selected_id = if this.selected_id == Some(id) {
-            None
-        } else {
-            Some(id)
-        };
-        cx.notify();
-    }))
-    .child(
-        div()
-            .flex_1()
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .child(message.title.clone()),
-    )
-    .child(
-        div()
-            .text_color(theme.quiet)
-            .whitespace_nowrap()
-            .child(format_local_time(message.time)),
-    )
-}
-
-fn message_meta(message: &LoggedMessage) -> String {
-    let mut meta = format!(
-        "{} · {} · Priorität {}",
-        format_local_time(message.time),
-        message.app,
-        message.priority
-    );
-    if let Some(sound) = message.sound.as_deref() {
-        meta.push_str(" · ");
-        meta.push_str(sound);
-    }
-    meta
+    let url = message.url.clone();
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .py(px(8.))
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .id(SharedString::from(format!("msg-{id}")))
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.selected_id = if this.selected_id == Some(id) {
+                        None
+                    } else {
+                        Some(id)
+                    };
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .w(px(96.))
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_color(theme.quiet)
+                        .child(message.app.clone()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_color(if selected { theme.accent } else { theme.text })
+                        .child(message.title.clone()),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(theme.quiet)
+                        .whitespace_nowrap()
+                        .child(format_local_time(message.time)),
+                ),
+        )
+        .when(selected, |row| {
+            let body = message_body(message);
+            row.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .whitespace_normal()
+                    .when(!body.is_empty(), |block| block.child(div().child(body)))
+                    .when_some(url, |block, url| {
+                        block.child(
+                            div()
+                                .id("message-url")
+                                .cursor_pointer()
+                                .underline()
+                                .text_color(theme.accent)
+                                .overflow_hidden()
+                                .child(url.clone())
+                                .on_click(move |_, _, cx| {
+                                    cx.open_url(&url);
+                                }),
+                        )
+                    }),
+            )
+        })
 }
 
 fn message_body(message: &LoggedMessage) -> String {
-    if message.text.is_empty() {
-        "Kein Text.".into()
-    } else {
-        message.text.clone()
-    }
+    message.text.clone()
 }
 
 fn emergency_card(
@@ -881,29 +765,86 @@ fn emergency_card(
         )
 }
 
-fn footer(status: SharedString, theme: &FormTheme, _logged_in: bool) -> impl IntoElement {
+fn top_bar(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settings>) -> impl IntoElement {
+    div()
+        .flex()
+        .items_end()
+        .gap(px(16.))
+        .h(px(44.))
+        .px(px(20.))
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .pb(px(8.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .child("Openover"),
+        )
+        .child(
+            tab_button(
+                "tab-messages",
+                "Nachrichten",
+                settings.pane == Pane::Messages,
+                theme,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.reload_messages();
+                this.pane = Pane::Messages;
+                cx.notify();
+            })),
+        )
+        .child(
+            tab_button(
+                "tab-account",
+                "Konto",
+                settings.pane == Pane::Account,
+                theme,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.pane = Pane::Account;
+                cx.notify();
+            })),
+        )
+        .child(
+            tab_button(
+                "tab-preferences",
+                "Einstellungen",
+                settings.pane == Pane::Preferences,
+                theme,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.pane = Pane::Preferences;
+                cx.notify();
+            })),
+        )
+        .child(div().flex_1())
+        .child(
+            div()
+                .pb(px(8.))
+                .text_color(theme.quiet)
+                .child(settings.connection.label()),
+        )
+}
+
+fn account_links(theme: &FormTheme) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
-        .gap(px(8.))
+        .gap(px(6.))
+        .pt(px(8.))
         .text_color(theme.quiet)
-        .when(!status.is_empty(), |footer| {
-            footer.child(div().whitespace_normal().child(status))
-        })
         .child(
             div()
                 .id("open-pushover")
                 .cursor_pointer()
-                .underline()
-                .child("Account und Desktop-Lizenz auf pushover.net")
+                .child("pushover.net")
                 .on_click(|_, _, cx| cx.open_url("https://pushover.net/clients/desktop")),
         )
         .child(
             div()
                 .id("open-signup")
                 .cursor_pointer()
-                .underline()
-                .child("Noch kein Konto? pushover.net/signup")
+                .child("pushover.net/signup")
                 .on_click(|_, _, cx| cx.open_url("https://pushover.net/signup")),
         )
 }
@@ -916,18 +857,12 @@ fn tab_button(
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(6.))
         .cursor_pointer()
-        .text_color(if active { theme.text } else { theme.quiet })
+        .pb(px(6.))
+        .border_b(px(2.))
+        .border_color(if active { theme.accent } else { theme.border })
+        .text_color(if active { theme.accent } else { theme.quiet })
         .child(label)
-        .child(div().w(px(28.)).h(px(2.)).rounded_md().bg(if active {
-            theme.accent
-        } else {
-            theme.surface
-        }))
 }
 
 fn primary_button(
@@ -1063,7 +998,8 @@ pub fn install(cx: &mut App) {
         settings.update(cx, |this, cx| {
             this.logged_in = true;
             this.connection = Connection::Connecting;
-            this.status = "Gespeicherte Anmeldung gefunden. Verbinde…".into();
+            this.pane = Pane::Messages;
+            this.status = SharedString::default();
             cx.notify();
         });
         crate::tray::set_tooltip_text(cx, Connection::Connecting.tooltip());
@@ -1114,7 +1050,7 @@ pub fn open_settings_window(cx: &mut App) {
 
     let view = settings_entity(cx);
     let email = view.read(cx).email.clone();
-    let bounds = Bounds::centered(None, size(px(440.), px(640.)), cx);
+    let bounds = Bounds::centered(None, size(px(560.), px(680.)), cx);
     match cx.open_window(
         WindowOptions::default()
             .window_bounds(WindowBounds::Windowed(bounds))
@@ -1123,7 +1059,9 @@ pub fn open_settings_window(cx: &mut App) {
                 ..Default::default()
             })),
         move |window, cx| {
-            email.focus_handle(cx).focus(window, cx);
+            if !view.read(cx).logged_in {
+                email.focus_handle(cx).focus(window, cx);
+            }
             view
         },
     ) {
