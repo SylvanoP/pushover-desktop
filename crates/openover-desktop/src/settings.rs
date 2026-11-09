@@ -315,6 +315,7 @@ impl Settings {
                 open_settings = true;
             }
             SessionEvent::Activate => open_settings = true,
+            #[cfg(windows)]
             SessionEvent::OpenMessage { id } => {
                 self.reload_messages();
                 self.pane = Pane::Messages;

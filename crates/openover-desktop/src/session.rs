@@ -29,6 +29,7 @@ pub enum SessionCommand {
         enabled: bool,
         volume: u8,
     },
+    #[cfg(windows)]
     OpenMessage {
         id: u64,
     },
@@ -72,15 +73,36 @@ pub enum SessionEvent {
     Status(String),
     TwoFactorRequired,
     LoginFailed(String),
-    LoggedIn { epoch: u64 },
-    LoggedOut { epoch: u64 },
-    Notify { epoch: u64, toast: Toast },
-    EmergencyAcknowledged { receipt: String },
-    Connection { epoch: u64, state: Connection },
-    BacklogDropped { epoch: u64, count: usize },
-    SessionLost { epoch: u64, message: String },
+    LoggedIn {
+        epoch: u64,
+    },
+    LoggedOut {
+        epoch: u64,
+    },
+    Notify {
+        epoch: u64,
+        toast: Toast,
+    },
+    EmergencyAcknowledged {
+        receipt: String,
+    },
+    Connection {
+        epoch: u64,
+        state: Connection,
+    },
+    BacklogDropped {
+        epoch: u64,
+        count: usize,
+    },
+    SessionLost {
+        epoch: u64,
+        message: String,
+    },
     Activate,
-    OpenMessage { id: u64 },
+    #[cfg(windows)]
+    OpenMessage {
+        id: u64,
+    },
 }
 
 pub fn start(
@@ -156,6 +178,7 @@ async fn session_main(
             SessionCommand::Acknowledge { receipt } => live.acknowledge(&receipt).await,
             SessionCommand::Logout => live.logout().await,
             SessionCommand::SetSound { enabled, volume } => live.set_sound(enabled, volume),
+            #[cfg(windows)]
             SessionCommand::OpenMessage { id } => {
                 let _ = live.events.unbounded_send(SessionEvent::OpenMessage { id });
             }

@@ -17,6 +17,7 @@ pub fn play_and_wait(path: PathBuf, volume: u8) {
     playback::play_and_wait(path, volume);
 }
 
+#[cfg(windows)]
 pub fn mci_volume(volume: u8) -> u32 {
     u32::from(volume.min(100)) * 10
 }
@@ -127,7 +128,7 @@ mod playback {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::mci_volume;
 
