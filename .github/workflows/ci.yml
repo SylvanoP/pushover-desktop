@@ -19,6 +19,25 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Linux dependencies (GPUI)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libdbus-1-dev \
+            libssl-dev \
+            libasound2-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libxcursor-dev \
+            libxfixes-dev \
+            libfontconfig-dev \
+            libfreetype6-dev
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all
@@ -39,7 +58,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libasound2-dev libssl-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-dev \
-            libxi-dev libxrandr-dev libxcursor-dev libxfixes-dev \
-            libfontconfig-dev libfreetype6-dev
+            pkg-config \
+            libdbus-1-dev \
+            libssl-dev \
+            libasound2-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libxcursor-dev \
+            libxfixes-dev \
+            libfontconfig-dev \
+            libfreetype6-dev
       - run: cargo build --release -p openover-desktop
