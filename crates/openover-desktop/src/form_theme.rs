@@ -11,6 +11,9 @@ pub struct FormTheme {
     pub quiet: Rgba,
     pub placeholder: Rgba,
     pub selection: Hsla,
+    pub connected: Rgba,
+    pub pending: Rgba,
+    pub stopped: Rgba,
 }
 
 impl FormTheme {
@@ -32,6 +35,9 @@ impl FormTheme {
             quiet: rgb(0x6f6a62),
             placeholder: rgb(0x8a847c),
             selection: hsla(0.08, 0.04, 0.86, 1.0),
+            connected: rgb(0x2f7d4a),
+            pending: rgb(0xb86e00),
+            stopped: rgb(0xb42318),
         }
     }
 
@@ -46,6 +52,9 @@ impl FormTheme {
             quiet: rgb(0xa39e94),
             placeholder: rgb(0x8d887f),
             selection: hsla(0.08, 0.03, 0.32, 1.0),
+            connected: rgb(0x7dcea0),
+            pending: rgb(0xf0c36a),
+            stopped: rgb(0xf0a8a0),
         }
     }
 }

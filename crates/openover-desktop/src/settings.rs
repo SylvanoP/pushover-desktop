@@ -1,13 +1,16 @@
+use std::time::Duration;
+
 use crate::form_theme::{FormTheme, field_chrome, field_height};
 use crate::password_field::MaskedPassword;
 use crate::session::{Connection, SessionCommand, SessionCommands, SessionEvent};
 
 use futures_util::StreamExt as _;
 use gpui::{
-    App, Bounds, Context, DispatchPhase, Entity, Focusable, Global, Hitbox, KeyDownEvent,
-    MouseButton, MouseMoveEvent, Pixels, Point, SharedString, Subscription, SystemNotification,
-    SystemNotificationAction, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
-    div, prelude::*, px, relative, rgb_to_hsla, size,
+    Animation, AnimationExt, App, Bounds, Context, DispatchPhase, Entity, Focusable, Global,
+    Hitbox, KeyDownEvent, MouseButton, MouseMoveEvent, Pixels, Point, SharedString, Subscription,
+    SystemNotification, SystemNotificationAction, TitlebarOptions, Window, WindowBounds,
+    WindowHandle, WindowOptions, div, prelude::*, pulsating_between, px, relative, rgb_to_hsla,
+    size,
 };
 use gpui_ce_elements::editable_text::{
     EditableTextState, StringStorage, TextChanged,
@@ -50,6 +53,7 @@ pub struct Settings {
     dragging_volume: bool,
     volume_bounds: Option<Bounds<Pixels>>,
     messages: Vec<LoggedMessage>,
+    confirm_clear: bool,
     selected_id: Option<u64>,
     epoch: u64,
     status: SharedString,
@@ -91,6 +95,7 @@ impl Settings {
             dragging_volume: false,
             volume_bounds: None,
             messages: openover_core::load_message_log(),
+            confirm_clear: false,
             selected_id: None,
             epoch: 0,
             status: SharedString::default(),
@@ -196,10 +201,21 @@ impl Settings {
         self.messages = openover_core::load_message_log();
     }
 
+    fn ask_clear(&mut self, cx: &mut Context<Self>) {
+        self.confirm_clear = true;
+        cx.notify();
+    }
+
+    fn cancel_clear(&mut self, cx: &mut Context<Self>) {
+        self.confirm_clear = false;
+        cx.notify();
+    }
+
     fn clear_messages(&mut self, cx: &mut Context<Self>) {
         openover_core::clear_message_log();
         self.messages.clear();
         self.selected_id = None;
+        self.confirm_clear = false;
         cx.notify();
     }
 
@@ -259,6 +275,7 @@ impl Settings {
                 self.connection = Connection::SignedOut;
                 self.pane = Pane::Account;
                 self.pending_emergency = None;
+                self.confirm_clear = false;
                 self.status = SharedString::default();
                 crate::tray::set_tooltip_text(cx, Connection::SignedOut.tooltip());
                 open_settings = true;
@@ -308,6 +325,7 @@ impl Settings {
                 self.logged_in = false;
                 self.connection = Connection::SessionEnded;
                 self.pane = Pane::Account;
+                self.confirm_clear = false;
                 self.status = message.into();
                 crate::tray::set_tooltip_text(cx, Connection::SessionEnded.tooltip());
                 open_settings = true;
@@ -638,17 +656,7 @@ fn messages_pane(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settin
         .flex()
         .flex_col()
         .gap(px(8.))
-        .child(
-            div().flex().justify_end().child(
-                div()
-                    .id("clear-messages")
-                    .cursor_pointer()
-                    .text_xs()
-                    .text_color(theme.accent)
-                    .child("Leeren")
-                    .on_click(cx.listener(|this, _, _, cx| this.clear_messages(cx))),
-            ),
-        )
+        .child(clear_control(settings.confirm_clear, theme, cx))
         .child(list)
 }
 
@@ -765,6 +773,71 @@ fn emergency_card(
         )
 }
 
+fn clear_control(confirm: bool, theme: &FormTheme, cx: &mut Context<Settings>) -> gpui::Div {
+    if !confirm {
+        return div().flex().justify_end().child(
+            div()
+                .id("clear-messages")
+                .cursor_pointer()
+                .text_xs()
+                .text_color(theme.accent)
+                .child("Leeren")
+                .on_click(cx.listener(|this, _, _, cx| this.ask_clear(cx))),
+        );
+    }
+
+    div().flex().justify_end().child(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .h(field_height())
+            .px_3()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.field)
+            .child("Wirklich leeren?")
+            .child(
+                div()
+                    .id("confirm-clear")
+                    .cursor_pointer()
+                    .text_color(theme.accent)
+                    .child("Leeren")
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_messages(cx))),
+            )
+            .child(
+                div()
+                    .id("cancel-clear")
+                    .cursor_pointer()
+                    .text_color(theme.quiet)
+                    .child("Abbrechen")
+                    .on_click(cx.listener(|this, _, _, cx| this.cancel_clear(cx))),
+            ),
+    )
+}
+
+fn connection_dot(connection: Connection, theme: &FormTheme) -> impl IntoElement {
+    let color = match connection {
+        Connection::Connected => theme.connected,
+        Connection::Connecting | Connection::Reconnecting => theme.pending,
+        Connection::SignedOut | Connection::SyncFailed | Connection::SessionEnded => theme.stopped,
+    };
+    div()
+        .size(px(8.))
+        .flex_shrink_0()
+        .rounded_full()
+        .bg(color)
+        .with_animation(
+            "connection-pulse",
+            Animation::new(Duration::from_millis(1600))
+                .repeat()
+                .with_easing(pulsating_between(0.35, 1.0))
+                .with_max_fps(30.),
+            |dot, opacity| dot.opacity(opacity),
+        )
+}
+
 fn top_bar(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settings>) -> impl IntoElement {
     div()
         .flex()
@@ -820,8 +893,12 @@ fn top_bar(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settings>) -
         .child(div().flex_1())
         .child(
             div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
                 .pb(px(8.))
                 .text_color(theme.quiet)
+                .child(connection_dot(settings.connection, theme))
                 .child(settings.connection.label()),
         )
 }
