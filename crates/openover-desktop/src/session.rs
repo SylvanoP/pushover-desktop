@@ -1,12 +1,15 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use futures_channel::mpsc::UnboundedSender;
 use openover_core::{
-    ApiError, CredentialStore, LocalState, PushLoop, PushLoopEvent, PushoverClient,
-    StoredCredentials, Toast, plan_sync, wipe_secret,
+    ApiError, CredentialStore, LocalState, PendingEmergency, PushLoop, PushLoopEvent,
+    PushoverClient, StoredCredentials, Toast, cursor_after_delete, plan_sync, wipe_secret,
 };
 use tokio::sync::{mpsc, watch};
+
+const EMERGENCY_REPEAT: Duration = Duration::from_secs(30);
 
 pub struct SessionCommands(pub mpsc::UnboundedSender<SessionCommand>);
 
@@ -20,15 +23,44 @@ pub enum SessionCommand {
     Acknowledge {
         receipt: String,
     },
+    Logout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connection {
+    SignedOut,
+    Connecting,
+    Connected,
+    Reconnecting,
+    SyncFailed,
+    SessionEnded,
+}
+
+impl Connection {
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Self::SignedOut => "Openover — nicht angemeldet",
+            Self::Connecting => "Openover — verbinde…",
+            Self::Connected => "Openover — verbunden",
+            Self::Reconnecting => "Openover — Verbindung unterbrochen, neuer Versuch…",
+            Self::SyncFailed => "Openover — Nachrichtenabruf fehlgeschlagen",
+            Self::SessionEnded => "Openover — Sitzung beendet, bitte erneut anmelden",
+        }
+    }
 }
 
 pub enum SessionEvent {
     Status(String),
     TwoFactorRequired,
     LoginFailed(String),
-    LoggedIn { device_id: String },
-    Notify(Toast),
-    EmergencyAcknowledged,
+    LoggedIn { epoch: u64, device_id: String },
+    LoggedOut { epoch: u64 },
+    Notify { epoch: u64, toast: Toast },
+    EmergencyAcknowledged { receipt: String },
+    Connection { epoch: u64, state: Connection },
+    BacklogDropped { epoch: u64, count: usize },
+    SessionLost { epoch: u64, message: String },
+    Activate,
 }
 
 pub fn start(
@@ -56,7 +88,8 @@ pub fn start(
 
 struct Live {
     client: PushoverClient,
-    secret: Option<String>,
+    secret: Arc<Mutex<Option<String>>>,
+    state: Arc<Mutex<LocalState>>,
     generation: Arc<AtomicU64>,
     stop: Option<watch::Sender<bool>>,
     events: UnboundedSender<SessionEvent>,
@@ -78,7 +111,8 @@ async fn session_main(
     };
     let mut live = Live {
         client,
-        secret: None,
+        secret: Arc::new(Mutex::new(None)),
+        state: Arc::new(Mutex::new(LocalState::load())),
         generation: Arc::new(AtomicU64::new(0)),
         stop: None,
         events,
@@ -100,27 +134,44 @@ async fn session_main(
                 wipe_secret(&mut password);
             }
             SessionCommand::Acknowledge { receipt } => live.acknowledge(&receipt).await,
+            SessionCommand::Logout => live.logout().await,
         }
     }
 }
 
 impl Live {
-    fn adopt(&mut self, creds: &StoredCredentials) {
-        self.secret = Some(creds.secret.clone());
+    fn adopt(&self, creds: &StoredCredentials) {
+        *lock_secret(&self.secret) = Some(creds.secret.clone());
     }
 
-    fn spawn_push(&mut self, creds: StoredCredentials) {
+    fn stop_push(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(true);
         }
+    }
+
+    fn spawn_push(&mut self, creds: StoredCredentials) {
+        self.stop_push();
         let (stop_tx, stop_rx) = watch::channel(false);
         self.stop = Some(stop_tx);
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let epoch = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let flag = Arc::clone(&self.generation);
         let client = self.client.clone();
         let events = self.events.clone();
+        let state = Arc::clone(&self.state);
+        let secret = Arc::clone(&self.secret);
         tokio::spawn(async move {
-            run_push(client, creds, generation, flag, stop_rx, events).await;
+            run_push(PushRun {
+                client,
+                creds,
+                epoch,
+                flag,
+                stop: stop_rx,
+                events,
+                state,
+                secret,
+            })
+            .await;
         });
     }
 
@@ -139,21 +190,12 @@ impl Live {
             }
         };
 
-        let existing = tokio::task::spawn_blocking(CredentialStore::load)
-            .await
-            .ok()
-            .and_then(Result::ok);
-        let reused = existing.and_then(|creds| {
-            let same_user = creds
-                .user_key
-                .as_ref()
-                .is_none_or(|user_key| user_key == &login.user_key);
-            if same_user && !creds.device_id.is_empty() {
-                Some(creds.device_id)
-            } else {
-                None
-            }
-        });
+        let user_key = login.user_key.clone();
+        let reused =
+            tokio::task::spawn_blocking(move || CredentialStore::device_id_for_user(&user_key))
+                .await
+                .ok()
+                .flatten();
 
         let (device_id, registered_new) = if let Some(device_id) = reused {
             (device_id, false)
@@ -196,9 +238,15 @@ impl Live {
             }
         }
 
-        if registered_new {
-            let mut state = LocalState::load();
-            state.device_name = Some(device_name.trim().to_string());
+        {
+            let mut state = lock_state(&self.state);
+            if registered_new {
+                state.last_message_id = None;
+                state.held_from = None;
+                state.shown_through = None;
+                state.emergencies.clear();
+                state.device_name = Some(device_name.trim().to_string());
+            }
             if let Err(err) = state.save() {
                 tracing::warn!("could not store device name: {err}");
             }
@@ -207,13 +255,15 @@ impl Live {
         self.adopt(&creds);
         let device_id = creds.device_id.clone();
         self.spawn_push(creds);
+        let epoch = self.generation.load(Ordering::SeqCst);
         let _ = self
             .events
-            .unbounded_send(SessionEvent::LoggedIn { device_id });
+            .unbounded_send(SessionEvent::LoggedIn { epoch, device_id });
     }
 
     async fn acknowledge(&self, receipt: &str) {
-        let Some(secret) = self.secret.clone() else {
+        let secret = lock_secret(&self.secret).clone();
+        let Some(secret) = secret else {
             let _ = self.events.unbounded_send(SessionEvent::Status(
                 "Keine Sitzung für die Bestätigung.".into(),
             ));
@@ -221,9 +271,15 @@ impl Live {
         };
         match self.client.acknowledge_emergency(&secret, receipt).await {
             Ok(()) => {
+                lock_state(&self.state).forget_emergency_receipt(receipt);
+                if let Err(err) = lock_state(&self.state).save() {
+                    tracing::warn!("could not store acknowledgement: {err}");
+                }
                 let _ = self
                     .events
-                    .unbounded_send(SessionEvent::EmergencyAcknowledged);
+                    .unbounded_send(SessionEvent::EmergencyAcknowledged {
+                        receipt: receipt.to_string(),
+                    });
             }
             Err(err) => {
                 let _ = self.events.unbounded_send(SessionEvent::Status(format!(
@@ -232,62 +288,217 @@ impl Live {
             }
         }
     }
+
+    async fn logout(&mut self) {
+        let epoch = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.stop_push();
+        *lock_secret(&self.secret) = None;
+        let cleared = tokio::task::spawn_blocking(CredentialStore::clear_secret).await;
+        if let Ok(Err(err)) = cleared {
+            tracing::warn!("could not clear session secret: {err}");
+        }
+        let _ = self
+            .events
+            .unbounded_send(SessionEvent::LoggedOut { epoch });
+    }
 }
 
-async fn run_push(
+struct SyncReport {
+    discarded: usize,
+    delete_failed: bool,
+}
+
+struct PushRun {
     client: PushoverClient,
     creds: StoredCredentials,
-    generation: u64,
+    epoch: u64,
     flag: Arc<AtomicU64>,
     stop: watch::Receiver<bool>,
     events: UnboundedSender<SessionEvent>,
-) {
-    if !still_current(&flag, generation) {
+    state: Arc<Mutex<LocalState>>,
+    secret: Arc<Mutex<Option<String>>>,
+}
+
+async fn run_push(push: PushRun) {
+    let PushRun {
+        client,
+        creds,
+        epoch,
+        flag,
+        mut stop,
+        events,
+        state,
+        secret,
+    } = push;
+    if !still_current(&flag, epoch) {
         return;
     }
-    let mut state = LocalState::load();
-    if let Err(err) = sync_messages(
-        &client, &creds, &mut state, &events, true, generation, &flag,
-    )
-    .await
-    {
-        tracing::warn!("startup sync failed: {err}");
-        if still_current(&flag, generation) {
-            let _ = events.unbounded_send(SessionEvent::Status(format!(
-                "Nachrichtenabruf fehlgeschlagen: {err}"
-            )));
+    send(
+        &events,
+        SessionEvent::Connection {
+            epoch,
+            state: Connection::Connecting,
+        },
+    );
+    let mut fetch_ok = true;
+    match sync_messages(&client, &creds, &state, &events, true, epoch, &flag).await {
+        Ok(report) => {
+            if !still_current(&flag, epoch) {
+                return;
+            }
+            if report.discarded > 0 {
+                send(
+                    &events,
+                    SessionEvent::BacklogDropped {
+                        epoch,
+                        count: report.discarded,
+                    },
+                );
+            }
+            if report.delete_failed {
+                fetch_ok = false;
+                send(
+                    &events,
+                    SessionEvent::Connection {
+                        epoch,
+                        state: Connection::SyncFailed,
+                    },
+                );
+            } else if report.discarded == 0 {
+                send(
+                    &events,
+                    SessionEvent::Status(format!(
+                        "Gerät {}. Warte auf die Push-Verbindung.",
+                        creds.device_id
+                    )),
+                );
+            }
+        }
+        Err(err) => {
+            fetch_ok = false;
+            tracing::warn!("startup sync failed: {err}");
+            send(
+                &events,
+                SessionEvent::Connection {
+                    epoch,
+                    state: Connection::SyncFailed,
+                },
+            );
+            send(
+                &events,
+                SessionEvent::Status(format!("Nachrichtenabruf fehlgeschlagen: {err}")),
+            );
         }
     }
-    if *stop.borrow() || !still_current(&flag, generation) {
+    if *stop.borrow() || !still_current(&flag, epoch) {
         return;
     }
 
     tracing::info!("connecting push websocket");
     let push = PushLoop::new(creds.device_id.clone(), creds.secret.clone());
     let (_task, mut frames) = push.spawn(stop.clone());
-    while let Some(frame) = frames.recv().await {
-        if *stop.borrow() || !still_current(&flag, generation) {
+    let mut nag = tokio::time::interval(EMERGENCY_REPEAT);
+    nag.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    nag.tick().await;
+
+    loop {
+        if *stop.borrow() || !still_current(&flag, epoch) {
             break;
         }
-        match frame {
-            PushLoopEvent::Sync => {
-                if let Err(err) = sync_messages(
-                    &client, &creds, &mut state, &events, false, generation, &flag,
-                )
-                .await
-                {
-                    tracing::warn!("sync failed: {err}");
+        tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    break;
                 }
             }
-            PushLoopEvent::Fatal(code) => {
-                let message = match code {
-                    'A' => "Die Sitzung wurde an anderer Stelle übernommen. Bitte erneut anmelden.",
-                    _ => "Pushover hat die Verbindung beendet. Bitte erneut anmelden.",
-                };
-                let _ = events.unbounded_send(SessionEvent::Status(message.into()));
-                break;
+            frame = frames.recv() => {
+                match frame {
+                    None => break,
+                    Some(PushLoopEvent::Connected) => {
+                        let state = if fetch_ok {
+                            Connection::Connected
+                        } else {
+                            Connection::SyncFailed
+                        };
+                        send(&events, SessionEvent::Connection { epoch, state });
+                        if fetch_ok {
+                            send(
+                                &events,
+                                SessionEvent::Status(format!(
+                                    "Verbunden. Gerät {}. Neue Nachrichten erscheinen als Benachrichtigung.",
+                                    creds.device_id
+                                )),
+                            );
+                        }
+                    }
+                    Some(PushLoopEvent::Disconnected) => {
+                        send(
+                            &events,
+                            SessionEvent::Connection {
+                                epoch,
+                                state: Connection::Reconnecting,
+                            },
+                        );
+                    }
+                    Some(PushLoopEvent::Sync) => {
+                        match sync_messages(&client, &creds, &state, &events, false, epoch, &flag).await {
+                            Ok(report) => {
+                                if !still_current(&flag, epoch) {
+                                    break;
+                                }
+                                if report.delete_failed {
+                                    fetch_ok = false;
+                                    send(&events, SessionEvent::Connection { epoch, state: Connection::SyncFailed });
+                                } else {
+                                    fetch_ok = true;
+                                    send(&events, SessionEvent::Connection { epoch, state: Connection::Connected });
+                                }
+                            }
+                            Err(err) => {
+                                fetch_ok = false;
+                                tracing::warn!("sync failed: {err}");
+                                send(&events, SessionEvent::Connection { epoch, state: Connection::SyncFailed });
+                                send(&events, SessionEvent::Status(format!("Nachrichtenabruf fehlgeschlagen: {err}")));
+                            }
+                        }
+                    }
+                    Some(PushLoopEvent::Fatal(code)) => {
+                        *lock_secret(&secret) = None;
+                        let cleared = tokio::task::spawn_blocking(CredentialStore::clear_secret).await;
+                        if let Ok(Err(err)) = cleared {
+                            tracing::warn!("could not clear session secret: {err}");
+                        }
+                        let message = match code {
+                            'A' => "Die Sitzung wurde an anderer Stelle übernommen. Bitte erneut anmelden.",
+                            _ => "Pushover hat die Verbindung beendet. Bitte erneut anmelden.",
+                        };
+                        send(
+                            &events,
+                            SessionEvent::SessionLost {
+                                epoch,
+                                message: message.to_string(),
+                            },
+                        );
+                        break;
+                    }
+                    Some(PushLoopEvent::KeepAlive | PushLoopEvent::Reload) => {}
+                }
             }
-            PushLoopEvent::KeepAlive | PushLoopEvent::Reload => {}
+            _ = nag.tick() => {
+                if !still_current(&flag, epoch) {
+                    break;
+                }
+                let pending = lock_state(&state).emergencies.clone();
+                for emergency in pending {
+                    let mut toast = emergency_toast(&emergency);
+                    toast = with_sound(&client, toast).await;
+                    if !still_current(&flag, epoch) {
+                        break;
+                    }
+                    send(&events, SessionEvent::Notify { epoch, toast });
+                }
+            }
         }
     }
 }
@@ -295,53 +506,160 @@ async fn run_push(
 async fn sync_messages(
     client: &PushoverClient,
     creds: &StoredCredentials,
-    state: &mut LocalState,
+    state: &Mutex<LocalState>,
     events: &UnboundedSender<SessionEvent>,
     startup: bool,
-    generation: u64,
+    epoch: u64,
     flag: &AtomicU64,
-) -> Result<(), ApiError> {
+) -> Result<SyncReport, ApiError> {
     let messages = client
         .fetch_messages(&creds.secret, &creds.device_id)
         .await?;
-    if !still_current(flag, generation) {
-        return Ok(());
+    if !still_current(flag, epoch) {
+        return Ok(SyncReport {
+            discarded: 0,
+            delete_failed: false,
+        });
     }
-    let plan = plan_sync(&messages, state.last_message_id, startup);
-    if plan.discarded > 0 {
-        let _ = events.unbounded_send(SessionEvent::Status(format!(
-            "{} ältere Nachrichten beim ersten Abruf verworfen.",
-            plan.discarded
-        )));
-    } else if startup && still_current(flag, generation) {
-        let _ = events.unbounded_send(SessionEvent::Status(format!(
-            "Verbunden. Gerät {}. Neue Nachrichten erscheinen als Benachrichtigung.",
-            creds.device_id
-        )));
-    }
+    let (deleted_through, held_from, shown_through) = {
+        let current = lock_state(state);
+        (
+            current.last_message_id,
+            current.held_from,
+            current.shown_through,
+        )
+    };
+    let plan = plan_sync(
+        &messages,
+        deleted_through,
+        held_from,
+        shown_through,
+        startup,
+    );
+
+    let mut emergencies = Vec::new();
     for toast in plan.toasts {
-        if !still_current(flag, generation) {
-            return Ok(());
+        if !still_current(flag, epoch) {
+            return Ok(SyncReport {
+                discarded: plan.discarded,
+                delete_failed: false,
+            });
         }
-        let _ = events.unbounded_send(SessionEvent::Notify(toast));
+        if let Some(receipt) = toast.receipt.clone() {
+            emergencies.push(PendingEmergency {
+                message_id: toast.message_id,
+                title: toast.title.clone(),
+                body: toast.body.clone(),
+                receipt,
+                sound: toast.sound.clone(),
+            });
+        }
+        let toast = with_sound(client, toast).await;
+        if !still_current(flag, epoch) {
+            return Ok(SyncReport {
+                discarded: plan.discarded,
+                delete_failed: false,
+            });
+        }
+        send(events, SessionEvent::Notify { epoch, toast });
     }
-    if let Some(id) = plan.last_seen {
-        state.last_message_id = Some(id);
-        if let Err(err) = state.save() {
-            tracing::warn!("could not store last message id: {err}");
+
+    let deleted = if let Some(id) = plan.delete_through {
+        if !still_current(flag, epoch) {
+            false
+        } else {
+            match client
+                .delete_through(&creds.secret, &creds.device_id, id)
+                .await
+            {
+                Ok(()) => true,
+                Err(err) => {
+                    tracing::warn!("delete_through failed: {err}");
+                    send(
+                        events,
+                        SessionEvent::Status(format!(
+                            "Löschen auf dem Server fehlgeschlagen: {err}"
+                        )),
+                    );
+                    false
+                }
+            }
+        }
+    } else {
+        false
+    };
+
+    if still_current(flag, epoch) {
+        let mut current = lock_state(state);
+        current.held_from = plan.held_from;
+        current.shown_through = plan.shown_through;
+        for emergency in emergencies {
+            current.remember_emergency(emergency);
+        }
+        for message in &messages {
+            if message.acked == Some(1)
+                && let Some(receipt) = &message.receipt
+            {
+                current.forget_emergency_receipt(receipt);
+            }
+        }
+        if deleted {
+            current.last_message_id =
+                cursor_after_delete(current.last_message_id, plan.delete_through, true);
+            if let Some(id) = current.last_message_id {
+                current.forget_emergencies_through(id);
+                if current.shown_through.is_some_and(|shown| id >= shown) {
+                    current.held_from = None;
+                    current.shown_through = None;
+                }
+            }
+        }
+        if let Err(err) = current.save() {
+            tracing::warn!("could not store message cursor: {err}");
         }
     }
-    if let Some(id) = plan.delete_through
-        && still_current(flag, generation)
-        && let Err(err) = client
-            .delete_through(&creds.secret, &creds.device_id, id)
-            .await
-    {
-        tracing::warn!("delete_through failed: {err}");
-    }
-    Ok(())
+
+    Ok(SyncReport {
+        discarded: plan.discarded,
+        delete_failed: plan.delete_through.is_some() && !deleted,
+    })
 }
 
-fn still_current(flag: &AtomicU64, generation: u64) -> bool {
-    flag.load(Ordering::SeqCst) == generation
+async fn with_sound(client: &PushoverClient, mut toast: Toast) -> Toast {
+    if let Some(code) = toast.sound.clone() {
+        match client.cache_sound(&code).await {
+            Ok(path) => toast.sound_path = Some(path),
+            Err(err) => tracing::warn!("sound unavailable: {err}"),
+        }
+    }
+    toast
+}
+
+fn emergency_toast(emergency: &PendingEmergency) -> Toast {
+    Toast {
+        message_id: emergency.message_id,
+        title: emergency.title.clone(),
+        body: emergency.body.clone(),
+        app: "Openover".into(),
+        priority: 2,
+        receipt: Some(emergency.receipt.clone()),
+        sound: emergency.sound.clone(),
+        sound_path: None,
+    }
+}
+
+fn send(events: &UnboundedSender<SessionEvent>, event: SessionEvent) {
+    let _ = events.unbounded_send(event);
+}
+
+fn still_current(flag: &AtomicU64, epoch: u64) -> bool {
+    flag.load(Ordering::SeqCst) == epoch
+}
+
+fn lock_state(state: &Mutex<LocalState>) -> MutexGuard<'_, LocalState> {
+    state.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+fn lock_secret(secret: &Mutex<Option<String>>) -> MutexGuard<'_, Option<String>> {
+    secret.lock().unwrap_or_else(|err| err.into_inner())
 }

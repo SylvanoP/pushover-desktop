@@ -1,6 +1,8 @@
+mod instance;
 mod password_field;
 mod session;
 mod settings;
+mod sound;
 mod tray;
 
 extern crate gpui_ce_backend as gpui;
@@ -22,6 +24,9 @@ struct Cli {
     /// Show a demo system notification at startup (no Pushover account required).
     #[arg(long)]
     demo_toast: bool,
+    /// Download and play one Pushover sound, for example `bike`.
+    #[arg(long, value_name = "CODE")]
+    play_sound: Option<String>,
 }
 
 fn main() {
@@ -32,6 +37,11 @@ fn main() {
         .init();
 
     let cli = Cli::parse();
+    if !instance::claim_primary() {
+        instance::signal_running_instance();
+        eprintln!("Openover läuft bereits.");
+        return;
+    }
 
     application()
         .with_quit_mode(QuitMode::Explicit)
@@ -49,7 +59,36 @@ fn main() {
             if cli.demo_toast {
                 show_demo_notification(cx);
             }
+            if let Some(code) = cli.play_sound.clone() {
+                play_sound_code(code);
+            }
         });
+}
+
+fn play_sound_code(code: String) {
+    std::thread::Builder::new()
+        .name("openover-sound-fetch".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let Ok(runtime) = runtime else {
+                return;
+            };
+            runtime.block_on(async move {
+                let Ok(client) = openover_core::PushoverClient::new() else {
+                    return;
+                };
+                match client.cache_sound(&code).await {
+                    Ok(path) => {
+                        tracing::info!("playing sound {code}");
+                        sound::play(path);
+                    }
+                    Err(err) => tracing::warn!("could not play sound {code}: {err}"),
+                }
+            });
+        })
+        .ok();
 }
 
 fn show_demo_notification(cx: &mut App) {

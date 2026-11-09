@@ -173,6 +173,53 @@ impl PushoverClient {
         Ok(())
     }
 
+    /// Download `https://api.pushover.net/sounds/{code}.mp3` into the local cache.
+    ///
+    /// A file already on disk is reused. The code is restricted to a single
+    /// path segment so a message cannot choose where the file is written.
+    pub async fn cache_sound(&self, code: &str) -> Result<std::path::PathBuf, ApiError> {
+        let code = crate::sound::sanitize_sound_code(code).ok_or(ApiError::InvalidParameter)?;
+        let path = crate::sound::sound_cache_dir().join(format!("{code}.mp3"));
+        if let Ok(meta) = std::fs::metadata(&path)
+            && meta.is_file()
+            && meta.len() >= 128
+        {
+            return Ok(path);
+        }
+        let response = self
+            .client
+            .get(format!("https://api.pushover.net/sounds/{code}.mp3"))
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ApiError::HttpStatus {
+                status: status.as_u16(),
+                body: "sound download failed".into(),
+            });
+        }
+        let bytes = response.bytes().await?;
+        if bytes.len() < 128
+            || bytes
+                .first()
+                .is_some_and(|byte| *byte == b'<' || *byte == b'{')
+        {
+            return Err(ApiError::SoundCache(
+                "response was not an audio file".into(),
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| ApiError::SoundCache(err.to_string()))?;
+        }
+        let tmp = path.with_extension("part");
+        std::fs::write(&tmp, &bytes).map_err(|err| ApiError::SoundCache(err.to_string()))?;
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        std::fs::rename(&tmp, &path).map_err(|err| ApiError::SoundCache(err.to_string()))?;
+        Ok(path)
+    }
+
     /// Multipart form body, matching the Open Client curl examples (`--form-string`).
     async fn post_multipart(
         &self,

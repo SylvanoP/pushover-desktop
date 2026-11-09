@@ -1,5 +1,5 @@
 use crate::password_field::MaskedPassword;
-use crate::session::{SessionCommand, SessionCommands, SessionEvent};
+use crate::session::{Connection, SessionCommand, SessionCommands, SessionEvent};
 
 use futures_util::StreamExt as _;
 use gpui::{
@@ -33,6 +33,7 @@ pub struct Settings {
     show_twofa: bool,
     busy: bool,
     logged_in: bool,
+    epoch: u64,
     status: SharedString,
     pending_emergency: Option<(String, String)>,
     _subscriptions: Vec<Subscription>,
@@ -64,6 +65,7 @@ impl Settings {
             show_twofa: false,
             busy: false,
             logged_in: false,
+            epoch: 0,
             status: "Noch nicht angemeldet. Das Passwort wird nicht gespeichert.".into(),
             pending_emergency: None,
             _subscriptions: subscriptions,
@@ -122,8 +124,16 @@ impl Settings {
         self.set_status("Bestätigung wird gesendet…", cx);
     }
 
+    fn accept_epoch(&mut self, epoch: u64) -> bool {
+        if epoch < self.epoch {
+            return false;
+        }
+        self.epoch = epoch;
+        true
+    }
+
     fn apply(&mut self, event: SessionEvent, cx: &mut Context<Self>) -> bool {
-        let mut open_emergency = false;
+        let mut open_settings = false;
         match event {
             SessionEvent::Status(text) => self.status = text.into(),
             SessionEvent::TwoFactorRequired => {
@@ -140,7 +150,10 @@ impl Settings {
                 self.busy = false;
                 self.status = format!("Anmeldung fehlgeschlagen: {detail}").into();
             }
-            SessionEvent::LoggedIn { device_id } => {
+            SessionEvent::LoggedIn { epoch, device_id } => {
+                if !self.accept_epoch(epoch) {
+                    return false;
+                }
                 self.busy = false;
                 self.logged_in = true;
                 self.show_twofa = false;
@@ -151,20 +164,68 @@ impl Settings {
                 )
                 .into();
             }
-            SessionEvent::Notify(toast) => {
+            SessionEvent::LoggedOut { epoch } => {
+                if !self.accept_epoch(epoch) {
+                    return false;
+                }
+                self.busy = false;
+                self.logged_in = false;
+                self.pending_emergency = None;
+                self.status =
+                    "Abgemeldet. Dasselbe Konto verwendet dieses Gerät beim nächsten Login wieder."
+                        .into();
+                crate::tray::set_tooltip_text(cx, Connection::SignedOut.tooltip());
+                open_settings = true;
+            }
+            SessionEvent::Notify { epoch, toast } => {
+                if !self.accept_epoch(epoch) {
+                    return false;
+                }
                 show_toast(cx, &toast);
                 if let Some(receipt) = toast.receipt.clone() {
                     self.pending_emergency = Some((receipt, toast.title.clone()));
-                    open_emergency = true;
                 }
             }
-            SessionEvent::EmergencyAcknowledged => {
-                self.pending_emergency = None;
+            SessionEvent::EmergencyAcknowledged { receipt } => {
+                if self
+                    .pending_emergency
+                    .as_ref()
+                    .is_some_and(|(current, _)| current == &receipt)
+                {
+                    self.pending_emergency = None;
+                }
                 self.status = "Notfall bestätigt.".into();
             }
+            SessionEvent::Connection { epoch, state } => {
+                if !self.accept_epoch(epoch) {
+                    return false;
+                }
+                crate::tray::set_tooltip_text(cx, state.tooltip());
+            }
+            SessionEvent::BacklogDropped { epoch, count } => {
+                if !self.accept_epoch(epoch) {
+                    return false;
+                }
+                show_backlog_toast(cx, count);
+                self.status = format!(
+                    "{count} ältere Nachrichten beim ersten Abruf verworfen. Ab jetzt nur neue."
+                )
+                .into();
+            }
+            SessionEvent::SessionLost { epoch, message } => {
+                if !self.accept_epoch(epoch) {
+                    return false;
+                }
+                self.busy = false;
+                self.logged_in = false;
+                self.status = message.into();
+                crate::tray::set_tooltip_text(cx, Connection::SessionEnded.tooltip());
+                open_settings = true;
+            }
+            SessionEvent::Activate => open_settings = true,
         }
         cx.notify();
-        open_emergency
+        open_settings
     }
 
     fn set_status(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -364,11 +425,26 @@ fn show_toast(cx: &mut App, toast: &Toast) {
             label: "Bestätigen".into(),
         });
     }
+    if let Some(path) = &toast.sound_path {
+        crate::sound::play(path.clone());
+    }
     cx.show_system_notification(SystemNotification {
         tag: format!("openover-{}", toast.message_id).into(),
         title: toast.title.clone().into(),
         body: toast.body.clone().into(),
         actions,
+    });
+}
+
+fn show_backlog_toast(cx: &mut App, count: usize) {
+    cx.show_system_notification(SystemNotification {
+        tag: "openover-backlog".into(),
+        title: "Ältere Nachrichten verworfen".into(),
+        body: format!(
+            "{count} ältere Nachrichten wurden beim ersten Abruf verworfen. Ab jetzt erscheinen nur neue."
+        )
+        .into(),
+        actions: vec![],
     });
 }
 
@@ -395,7 +471,7 @@ pub fn install(cx: &mut App) {
 
     let initial = CredentialStore::load().ok();
     let has_session = initial.is_some();
-    let (commands, mut events) = crate::session::start(initial);
+    let (commands, events) = crate::session::start(initial);
     cx.set_global(SessionCommands(commands));
 
     let settings = settings_entity(cx);
@@ -405,7 +481,9 @@ pub fn install(cx: &mut App) {
             this.status = "Gespeicherte Anmeldung gefunden. Verbinde…".into();
             cx.notify();
         });
+        crate::tray::set_tooltip_text(cx, Connection::Connecting.tooltip());
     } else {
+        crate::tray::set_tooltip_text(cx, Connection::SignedOut.tooltip());
         open_settings_window(cx);
     }
 
@@ -419,13 +497,16 @@ pub fn install(cx: &mut App) {
         send_acknowledge(cx, receipt);
     });
 
+    let (activate_tx, activate_rx) = futures_channel::mpsc::unbounded();
+    crate::instance::listen_for_activate(activate_tx);
+    let mut incoming = futures_util::stream::select(events, activate_rx);
     cx.spawn(async move |cx| {
-        while let Some(event) = events.next().await {
-            let open_emergency = cx.update(|cx| {
+        while let Some(event) = incoming.next().await {
+            let open_settings = cx.update(|cx| {
                 let settings = settings_entity(cx);
                 settings.update(cx, |settings, cx| settings.apply(event, cx))
             });
-            if open_emergency {
+            if open_settings {
                 cx.update(open_settings_window);
             }
         }

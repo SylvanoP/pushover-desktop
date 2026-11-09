@@ -6,12 +6,60 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// An emergency that must stay on this machine until the user acknowledges it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingEmergency {
+    pub message_id: u64,
+    pub title: String,
+    pub body: String,
+    pub receipt: String,
+    #[serde(default)]
+    pub sound: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalState {
     #[serde(default)]
     pub last_message_id: Option<u64>,
     #[serde(default)]
     pub device_name: Option<String>,
+    /// First id of a tail we already showed but could not delete yet.
+    #[serde(default)]
+    pub held_from: Option<u64>,
+    /// Last id of that tail. Ids inside the range are not toasted again.
+    #[serde(default)]
+    pub shown_through: Option<u64>,
+    #[serde(default)]
+    pub emergencies: Vec<PendingEmergency>,
+}
+
+impl PendingEmergency {
+    pub fn matches_receipt(&self, receipt: &str) -> bool {
+        self.receipt == receipt
+    }
+}
+
+impl LocalState {
+    pub fn remember_emergency(&mut self, emergency: PendingEmergency) {
+        if let Some(existing) = self
+            .emergencies
+            .iter_mut()
+            .find(|item| item.message_id == emergency.message_id)
+        {
+            *existing = emergency;
+            return;
+        }
+        self.emergencies.push(emergency);
+    }
+
+    pub fn forget_emergency_receipt(&mut self, receipt: &str) {
+        self.emergencies
+            .retain(|item| !item.matches_receipt(receipt));
+    }
+
+    pub fn forget_emergencies_through(&mut self, message_id: u64) {
+        self.emergencies.retain(|item| item.message_id > message_id);
+    }
 }
 
 impl LocalState {
@@ -82,6 +130,15 @@ mod tests {
         let state = LocalState {
             last_message_id: Some(42),
             device_name: Some("openover-pc".into()),
+            held_from: Some(7),
+            shown_through: Some(9),
+            emergencies: vec![PendingEmergency {
+                message_id: 8,
+                title: "Alarm".into(),
+                body: "body".into(),
+                receipt: "receipt-1".into(),
+                sound: Some("siren".into()),
+            }],
         };
         state.write(&path).unwrap();
         let loaded = LocalState::read(&path).unwrap();

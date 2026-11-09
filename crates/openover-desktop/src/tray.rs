@@ -1,15 +1,18 @@
+use crate::session::{SessionCommand, SessionCommands};
 use crate::settings;
 use gpui::{App, Global, MenuItem, actions};
 use gpui_tray::{Icon, Tray};
 
-actions!(openover_tray, [OpenSettings, Quit]);
+actions!(openover_tray, [OpenSettings, Logout, Quit]);
 
 struct AppTray(Tray);
 
 impl Global for AppTray {}
 
 pub fn setup(cx: &mut App) -> gpui_tray::Result<()> {
-    cx.on_action(open_settings).on_action(quit);
+    cx.on_action(open_settings)
+        .on_action(logout)
+        .on_action(quit);
 
     let tray = Tray::builder()
         .icon(tray_icon()?)
@@ -24,6 +27,7 @@ pub fn setup(cx: &mut App) -> gpui_tray::Result<()> {
 fn build_menu(_cx: &mut App) -> Vec<MenuItem> {
     vec![
         MenuItem::action("Einstellungen…", OpenSettings),
+        MenuItem::action("Abmelden", Logout),
         MenuItem::separator(),
         MenuItem::action("Beenden", Quit),
     ]
@@ -31,6 +35,19 @@ fn build_menu(_cx: &mut App) -> Vec<MenuItem> {
 
 fn open_settings(_: &OpenSettings, cx: &mut App) {
     settings::open_settings_window(cx);
+}
+
+fn logout(_: &Logout, cx: &mut App) {
+    if let Some(commands) = cx.try_global::<SessionCommands>() {
+        let _ = commands.0.send(SessionCommand::Logout);
+    }
+}
+
+pub fn set_tooltip_text(cx: &mut App, text: &str) {
+    let Some(tray) = cx.try_global::<AppTray>().map(|tray| tray.0.clone()) else {
+        return;
+    };
+    let _ = tray.set_tooltip(Some(text.to_string()), cx);
 }
 
 fn quit(_: &Quit, cx: &mut App) {

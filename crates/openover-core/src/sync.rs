@@ -3,6 +3,7 @@
 //! The Open Client API asks clients to drop a stale startup queue instead of
 //! notifying for every old message. After a cursor exists, only newer ids toast.
 
+use crate::sound::playback_code;
 use crate::types::Message;
 
 /// Pending messages above this count are dropped on the first startup sync
@@ -19,60 +20,136 @@ pub struct Toast {
     pub priority: i32,
     /// Set for an unacked emergency message so the UI can call acknowledge.
     pub receipt: Option<String>,
+    /// Pushover sound code to cache and play. `None` stays silent.
+    pub sound: Option<String>,
+    /// Filled after the mp3 is on disk. Planning leaves this empty.
+    pub sound_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncPlan {
     pub toasts: Vec<Toast>,
-    /// Highest id the server should delete through, when the batch was non-empty.
+    /// Highest id that can be deleted without removing an unacked emergency.
+    /// `None` when this batch has nothing safe to delete.
     pub delete_through: Option<u64>,
-    pub last_seen: Option<u64>,
     pub discarded: usize,
+    /// Tail already shown to the user and still sitting on the server.
+    pub held_from: Option<u64>,
+    pub shown_through: Option<u64>,
 }
 
-pub fn plan_sync(messages: &[Message], last_seen: Option<u64>, startup: bool) -> SyncPlan {
+/// Cursor to persist. A failed delete keeps the previous id.
+pub fn cursor_after_delete(
+    previous: Option<u64>,
+    delete_through: Option<u64>,
+    deleted: bool,
+) -> Option<u64> {
+    if deleted {
+        delete_through.or(previous)
+    } else {
+        previous
+    }
+}
+
+pub fn plan_sync(
+    messages: &[Message],
+    deleted_through: Option<u64>,
+    held_from: Option<u64>,
+    shown_through: Option<u64>,
+    startup: bool,
+) -> SyncPlan {
     let mut ordered: Vec<&Message> = messages.iter().collect();
     ordered.sort_by_key(|message| message.id);
     ordered.dedup_by_key(|message| message.id);
 
-    let Some(highest) = ordered.last().map(|message| message.id) else {
+    let fresh: Vec<&Message> = ordered
+        .iter()
+        .copied()
+        .filter(|message| deleted_through.is_none_or(|seen| message.id > seen))
+        .collect();
+
+    if fresh.is_empty() {
         return SyncPlan {
             toasts: Vec::new(),
             delete_through: None,
-            last_seen,
             discarded: 0,
-        };
-    };
-
-    let fresh: Vec<&Message> = match last_seen {
-        Some(seen) => ordered
-            .iter()
-            .copied()
-            .filter(|message| message.id > seen)
-            .collect(),
-        None => ordered.clone(),
-    };
-
-    if startup && last_seen.is_none() && fresh.len() > STALE_BACKLOG_LIMIT {
-        return SyncPlan {
-            toasts: Vec::new(),
-            delete_through: Some(highest),
-            last_seen: Some(highest),
-            discarded: fresh.len(),
+            held_from,
+            shown_through,
         };
     }
 
+    if startup && deleted_through.is_none() && fresh.len() > STALE_BACKLOG_LIMIT {
+        return SyncPlan {
+            toasts: Vec::new(),
+            delete_through: fresh.last().map(|message| message.id),
+            discarded: fresh.len(),
+            held_from: fresh.first().map(|message| message.id),
+            shown_through: fresh.last().map(|message| message.id),
+        };
+    }
+
+    let blocker = fresh
+        .iter()
+        .copied()
+        .find(|message| is_open_emergency(message))
+        .map(|message| message.id);
+
+    let delete_through = fresh
+        .iter()
+        .copied()
+        .filter(|message| blocker.is_none_or(|blocked| message.id < blocked))
+        .map(|message| message.id)
+        .max();
+
     let toasts = fresh
         .iter()
+        .copied()
         .filter(|message| message.priority > -2)
-        .map(|message| toast_for(message))
+        .filter(|message| !already_shown(message.id, held_from, shown_through))
+        .map(toast_for)
         .collect();
+
+    let (held_from, shown_through) = match blocker {
+        Some(blocked) => {
+            let held_max = fresh
+                .iter()
+                .copied()
+                .map(|message| message.id)
+                .filter(|id| *id >= blocked)
+                .max();
+            let from = Some(held_from.map_or(blocked, |from| from.min(blocked)));
+            let through = match (shown_through, held_max) {
+                (Some(shown), Some(max)) => Some(shown.max(max)),
+                (None, max) => max,
+                (shown, None) => shown,
+            };
+            (from, through)
+        }
+        None => (held_from, shown_through),
+    };
 
     SyncPlan {
         toasts,
-        delete_through: Some(highest),
-        last_seen: Some(highest.max(last_seen.unwrap_or(0))),
+        delete_through,
         discarded: 0,
+        held_from,
+        shown_through,
+    }
+}
+
+fn is_open_emergency(message: &Message) -> bool {
+    message.priority >= 2
+        && message.acked != Some(1)
+        && message
+            .receipt
+            .as_ref()
+            .is_some_and(|receipt| !receipt.is_empty())
+}
+
+fn already_shown(id: u64, held_from: Option<u64>, shown_through: Option<u64>) -> bool {
+    match (held_from, shown_through) {
+        (Some(from), Some(through)) => id >= from && id <= through,
+        _ => false,
     }
 }
 
@@ -123,6 +200,8 @@ fn toast_for(message: &Message) -> Toast {
         app: app.to_string(),
         priority: message.priority,
         receipt,
+        sound: playback_code(message.priority, message.sound.as_deref()),
+        sound_path: None,
     }
 }
 
@@ -186,16 +265,26 @@ mod tests {
 
     #[test]
     fn empty_batch_keeps_cursor() {
-        let plan = plan_sync(&[], Some(4), true);
+        let plan = plan_sync(&[], Some(4), None, None, true);
         assert!(plan.toasts.is_empty());
-        assert_eq!(plan.last_seen, Some(4));
         assert_eq!(plan.delete_through, None);
+        assert_eq!(
+            cursor_after_delete(Some(4), plan.delete_through, true),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn cursor_advances_only_when_delete_succeeds() {
+        assert_eq!(cursor_after_delete(Some(3), Some(8), false), Some(3));
+        assert_eq!(cursor_after_delete(Some(3), Some(8), true), Some(8));
+        assert_eq!(cursor_after_delete(None, None, false), None);
     }
 
     #[test]
     fn first_startup_toasts_a_short_queue() {
         let messages = vec![message(2, 0), message(1, 0)];
-        let plan = plan_sync(&messages, None, true);
+        let plan = plan_sync(&messages, None, None, None, true);
         assert_eq!(
             plan.toasts
                 .iter()
@@ -203,12 +292,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert_eq!(plan.last_seen, Some(2));
         assert_eq!(plan.delete_through, Some(2));
         assert_eq!(plan.discarded, 0);
         assert_eq!(plan.toasts[0].title, "T1");
         assert!(plan.toasts[0].body.contains("body 1"));
         assert!(plan.toasts[0].body.contains("Demo"));
+        assert_eq!(plan.toasts[0].sound.as_deref(), Some("pushover"));
     }
 
     #[test]
@@ -216,11 +305,22 @@ mod tests {
         let messages: Vec<_> = (1..=STALE_BACKLOG_LIMIT as u64 + 1)
             .map(|id| message(id, 0))
             .collect();
-        let plan = plan_sync(&messages, None, true);
+        let plan = plan_sync(&messages, None, None, None, true);
         assert!(plan.toasts.is_empty());
         assert_eq!(plan.discarded, STALE_BACKLOG_LIMIT + 1);
-        assert_eq!(plan.last_seen, Some(STALE_BACKLOG_LIMIT as u64 + 1));
-        assert_eq!(plan.delete_through, plan.last_seen);
+        let highest = STALE_BACKLOG_LIMIT as u64 + 1;
+        assert_eq!(plan.delete_through, Some(highest));
+        assert_eq!(plan.held_from, Some(1));
+        assert_eq!(plan.shown_through, Some(highest));
+    }
+
+    #[test]
+    fn discarded_backlog_is_not_toasted_on_the_next_live_sync() {
+        let highest = STALE_BACKLOG_LIMIT as u64 + 1;
+        let messages: Vec<_> = (1..=highest).map(|id| message(id, 0)).collect();
+        let plan = plan_sync(&messages, None, Some(1), Some(highest), false);
+        assert!(plan.toasts.is_empty());
+        assert_eq!(plan.delete_through, Some(highest));
     }
 
     #[test]
@@ -228,7 +328,7 @@ mod tests {
         let messages: Vec<_> = (1..=STALE_BACKLOG_LIMIT as u64 + 3)
             .map(|id| message(id, 0))
             .collect();
-        let plan = plan_sync(&messages, None, false);
+        let plan = plan_sync(&messages, None, None, None, false);
         assert_eq!(plan.toasts.len(), messages.len());
         assert_eq!(plan.discarded, 0);
     }
@@ -238,7 +338,7 @@ mod tests {
         let mut quiet = message(5, -2);
         quiet.title = Some("hidden".into());
         let messages = vec![message(3, 0), message(4, 0), quiet, message(6, 1)];
-        let plan = plan_sync(&messages, Some(4), true);
+        let plan = plan_sync(&messages, Some(4), None, None, true);
         assert_eq!(
             plan.toasts
                 .iter()
@@ -247,19 +347,65 @@ mod tests {
             vec![6]
         );
         assert_eq!(plan.delete_through, Some(6));
-        assert_eq!(plan.last_seen, Some(6));
     }
 
     #[test]
-    fn emergency_title_and_receipt() {
-        let mut emergency = message(9, 2);
+    fn emergency_blocks_delete_and_is_not_repeated_immediately() {
+        let mut emergency = message(5, 2);
         emergency.receipt = Some("abc123".into());
         emergency.acked = Some(0);
         emergency.title = Some("Alarm".into());
-        let plan = plan_sync(&[emergency], Some(1), false);
-        assert_eq!(plan.toasts[0].title, "Notfall: Alarm");
-        assert_eq!(plan.toasts[0].receipt.as_deref(), Some("abc123"));
-        assert_eq!(plan.toasts[0].app, "Demo");
+        emergency.sound = Some("siren".into());
+        let messages = vec![message(4, 0), emergency.clone(), message(6, 0)];
+        let plan = plan_sync(&messages, Some(1), None, None, false);
+        assert_eq!(plan.delete_through, Some(4));
+        assert_eq!(
+            plan.toasts
+                .iter()
+                .map(|toast| toast.message_id)
+                .collect::<Vec<_>>(),
+            vec![4, 5, 6]
+        );
+        assert_eq!(plan.toasts[1].title, "Notfall: Alarm");
+        assert_eq!(plan.toasts[1].receipt.as_deref(), Some("abc123"));
+        assert_eq!(plan.toasts[1].sound.as_deref(), Some("siren"));
+        assert_eq!(plan.held_from, Some(5));
+        assert_eq!(plan.shown_through, Some(6));
+
+        let again = plan_sync(
+            &messages,
+            Some(1),
+            plan.held_from,
+            plan.shown_through,
+            false,
+        );
+        assert_eq!(
+            again
+                .toasts
+                .iter()
+                .map(|toast| toast.message_id)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        assert_eq!(again.delete_through, Some(4));
+
+        let after_delete = plan_sync(
+            &[emergency, message(6, 0)],
+            Some(4),
+            again.held_from,
+            again.shown_through,
+            false,
+        );
+        assert!(after_delete.toasts.is_empty());
+        assert_eq!(after_delete.delete_through, None);
+    }
+
+    #[test]
+    fn low_priority_has_no_sound() {
+        let plan = plan_sync(&[message(3, -1)], None, None, None, false);
+        assert_eq!(plan.toasts.len(), 1);
+        assert_eq!(plan.toasts[0].sound, None);
+        assert_eq!(plan.delete_through, Some(3));
     }
 
     #[test]
@@ -269,7 +415,7 @@ mod tests {
         message.message = "<b>Hallo</b> &amp; Co".into();
         message.title = None;
         message.app = Some("App".into());
-        let plan = plan_sync(&[message], None, false);
+        let plan = plan_sync(&[message], None, None, None, false);
         assert_eq!(plan.toasts[0].title, "App");
         assert_eq!(plan.toasts[0].body, "Hallo & Co");
     }

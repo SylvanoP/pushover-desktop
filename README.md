@@ -1,6 +1,6 @@
 # Openover Desktop
 
-**Deutsch (primär)** — Inoffizieller **Pushover Open Client** für Windows, macOS und Linux. Tray-first: die App startet im System-Tray; ein minimales Fenster dient später den Einstellungen.
+**Deutsch (primär)** — Inoffizieller **Pushover Open Client** für Windows, macOS und Linux. Tray-first: die App startet im System-Tray; das Fenster ist die Anmeldung und die Einstellungen.
 
 > **Disclaimer:** Dieses Projekt ist **nicht** von Pushover LLC veröffentlicht oder unterstützt. Pushover® ist eine Marke von Pushover LLC. Bitte beachtet die [Pushover Distribution Guidelines](https://pushover.net/api/client/#distribution-guidelines) (kein „Pushover for …“ im Namen, kein Pushover-Logo als App-Icon).
 
@@ -14,9 +14,12 @@
 - Anmeldung im Einstellungsfenster (E-Mail, Passwort, optional 2FA, Gerätename)
 - `openover-core`: Login, Gerät `os=O`, Nachrichten, WebSocket mit Reconnect
 - Nach `!` werden neue Nachrichten als Systembenachrichtigung gezeigt (Titel, Text, App-Name)
-- Beim ersten Start wird eine große alte Warteschlange still verworfen; die letzte Nachrichten-ID liegt lokal
-- Zugangsdaten im OS-Keyring (`user key`, `secret`, `device id`). Das Passwort wird nicht gespeichert.
-- Keine Historie, keine Sounds, keine Bildanhänge
+- Pushover-Sounds (`sounds/{code}.mp3`) werden lokal gecacht und unter Windows abgespielt. Priorität -1 bleibt stumm. Die Windows-Toasts selbst haben keinen Ton
+- Beim ersten Start wird eine große alte Warteschlange verworfen und einmal angezeigt. Die letzte Nachrichten-ID wird erst nach erfolgreichem Löschen gespeichert
+- Notfälle bleiben lokal und werden etwa alle 30 Sekunden erneut gezeigt, bis sie bestätigt sind
+- Tray: Einstellungen, Abmelden, Beenden. Der Tooltip zeigt den Verbindungszustand. Ein zweiter Start öffnet die laufende Instanz
+- Zugangsdaten im OS-Keyring (`user key`, `secret`, `device id`). Das Passwort wird nicht gespeichert. Abmelden löscht nur das Sitzungsgeheimnis
+- Keine Historie, keine Bildanhänge
 
 Ohne gespeicherte Anmeldung öffnet sich das Fenster von selbst. Mit Anmeldung bleibt die App im Tray; Einstellungen liegen im Tray-Menü.
 

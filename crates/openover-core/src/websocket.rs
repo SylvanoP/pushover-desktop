@@ -23,6 +23,8 @@ pub enum StopReason {
 
 #[derive(Debug, Clone, Copy)]
 pub enum PushLoopEvent {
+    Connected,
+    Disconnected,
     KeepAlive,
     Sync,
     Reload,
@@ -74,6 +76,9 @@ impl PushLoop {
                     }
                     Err(err) => {
                         tracing::warn!("push websocket error: {err}");
+                        if !*stop.borrow() {
+                            let _ = tx.send(PushLoopEvent::Disconnected);
+                        }
                         tokio::select! {
                             biased;
                             changed = stop.changed() => {
@@ -109,6 +114,7 @@ impl PushLoop {
         ws.send(Message::Text(login.into()))
             .await
             .map_err(|err| WebSocketError::Connect(Box::new(err)))?;
+        let _ = tx.send(PushLoopEvent::Connected);
 
         loop {
             if *stop.borrow() {

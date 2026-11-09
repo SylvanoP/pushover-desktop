@@ -57,4 +57,71 @@ impl CredentialStore {
         }
         Ok(())
     }
+
+    /// Drops the session secret. Device id and user key stay so the same account
+    /// can sign in again without registering another device.
+    pub fn clear_secret() -> Result<(), CredentialError> {
+        delete_account(ACCOUNT_SECRET)
+    }
+
+    /// Device id previously stored for this exact user key.
+    ///
+    /// A missing user key does not match. Callers must not reuse a device just
+    /// because some id happens to be present.
+    pub fn device_id_for_user(user_key: &str) -> Option<String> {
+        let stored_user = keyring::Entry::new(SERVICE, ACCOUNT_USER)
+            .ok()?
+            .get_password()
+            .ok()?;
+        reusable_device_id(
+            Some(stored_user.as_str()),
+            &keyring::Entry::new(SERVICE, ACCOUNT_DEVICE)
+                .ok()?
+                .get_password()
+                .ok()?,
+            user_key,
+        )
+    }
+}
+
+fn delete_account(account: &str) -> Result<(), CredentialError> {
+    match keyring::Entry::new(SERVICE, account)?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Reuse a device only when the stored user key is present and equal.
+pub fn reusable_device_id(
+    stored_user_key: Option<&str>,
+    stored_device_id: &str,
+    login_user_key: &str,
+) -> Option<String> {
+    if stored_device_id.is_empty() {
+        return None;
+    }
+    match stored_user_key {
+        Some(user_key) if user_key == login_user_key => Some(stored_device_id.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_reuse_requires_the_same_user_key() {
+        assert_eq!(
+            reusable_device_id(Some("user-a"), "device-1", "user-a").as_deref(),
+            Some("device-1")
+        );
+        assert_eq!(
+            reusable_device_id(Some("user-a"), "device-1", "user-b"),
+            None
+        );
+        assert_eq!(reusable_device_id(None, "device-1", "user-a"), None);
+        assert_eq!(reusable_device_id(Some("user-a"), "", "user-a"), None);
+    }
 }

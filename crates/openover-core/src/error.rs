@@ -22,6 +22,8 @@ pub enum ApiError {
     HttpStatus { status: u16, body: String },
     #[error("invalid parameter")]
     InvalidParameter,
+    #[error("sound cache failed: {0}")]
+    SoundCache(String),
     #[error("{0}")]
     DeviceName(#[from] crate::device_name::DeviceNameError),
     #[error("invalid JSON response: {0}")]
