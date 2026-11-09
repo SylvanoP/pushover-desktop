@@ -1,7 +1,8 @@
+use crate::form_theme::{FormTheme, field_chrome};
 use gpui::{
     App, Bounds, Context, ElementInputHandler, EntityInputHandler, FocusHandle, Focusable,
-    KeyDownEvent, MouseButton, Pixels, Point, Render, UTF16Selection, Window, canvas,
-    colors::Colors, div, prelude::*, px,
+    KeyDownEvent, MouseButton, Pixels, Point, Render, UTF16Selection, Window, canvas, div,
+    prelude::*,
 };
 use openover_core::{PASSWORD_BULLET, apply_masked_replace, wipe_secret};
 use std::ops::Range;
@@ -272,7 +273,7 @@ impl EntityInputHandler for MaskedPassword {
 
 impl Render for MaskedPassword {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = Colors::for_appearance(window);
+        let theme = FormTheme::for_window(window);
         let focused = self.focus_handle.is_focused(window);
         let len = self.char_len();
         let selection = self.clamp_range(self.selection.clone());
@@ -282,61 +283,50 @@ impl Render for MaskedPassword {
         } else {
             bullet_line(len, selection.clone(), focused)
         };
-        let border = if focused {
-            colors.selected
-        } else {
-            colors.border
-        };
         let view = cx.entity();
         let focus_handle = self.focus_handle.clone();
 
-        div()
-            .id("openover-password")
-            .track_focus(&self.focus_handle)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    window.focus(&this.focus_handle, cx);
-                }),
-            )
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                this.edit_key(event, window, cx);
-            }))
-            .relative()
-            .w_full()
-            .h(px(40.))
-            .px_3()
-            .flex()
-            .items_center()
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .bg(colors.container)
-            .text_color(colors.text)
-            .child(
-                div()
-                    .when(placeholder && !focused, |line| {
-                        line.text_color(colors.disabled).child("Passwort")
-                    })
-                    .when(!(placeholder && !focused), |line| line.child(shown)),
-            )
-            .child(
-                canvas(
-                    |_, _, _| {},
-                    move |bounds, _, window, cx| {
-                        window.handle_input(
-                            &focus_handle,
-                            ElementInputHandler::new(bounds, view.clone()),
-                            cx,
-                        );
-                    },
+        field_chrome(
+            div()
+                .id("openover-password")
+                .track_focus(&self.focus_handle)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        window.focus(&this.focus_handle, cx);
+                    }),
                 )
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0(),
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    this.edit_key(event, window, cx);
+                }))
+                .relative(),
+            &theme,
+            focused,
+        )
+        .child(
+            div()
+                .when(placeholder && !focused, |line| {
+                    line.text_color(theme.placeholder).child("Passwort")
+                })
+                .when(!(placeholder && !focused), |line| line.child(shown)),
+        )
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, cx| {
+                    window.handle_input(
+                        &focus_handle,
+                        ElementInputHandler::new(bounds, view.clone()),
+                        cx,
+                    );
+                },
             )
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0(),
+        )
     }
 }
 

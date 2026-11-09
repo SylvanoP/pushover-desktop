@@ -1,3 +1,4 @@
+mod form_theme;
 mod instance;
 mod password_field;
 mod session;

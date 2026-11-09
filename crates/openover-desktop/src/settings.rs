@@ -1,3 +1,4 @@
+use crate::form_theme::{FormTheme, field_chrome, field_height};
 use crate::password_field::MaskedPassword;
 use crate::session::{Connection, SessionCommand, SessionCommands, SessionEvent};
 
@@ -5,7 +6,7 @@ use futures_util::StreamExt as _;
 use gpui::{
     App, Bounds, Context, Entity, Focusable, Global, KeyDownEvent, SharedString, Subscription,
     SystemNotification, SystemNotificationAction, TitlebarOptions, Window, WindowBounds,
-    WindowHandle, WindowOptions, colors::Colors, div, prelude::*, px, size,
+    WindowHandle, WindowOptions, div, prelude::*, px, rgb_to_hsla, size,
 };
 use gpui_ce_elements::editable_text::{
     EditableTextState, StringStorage, TextChanged,
@@ -236,7 +237,14 @@ impl Settings {
 
 impl Render for Settings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = Colors::for_appearance(window);
+        let theme = FormTheme::for_window(window);
+        let email_focused = self.email.read(cx).focus_handle(cx).is_focused(window);
+        let twofa_focused = self.twofa.read(cx).focus_handle(cx).is_focused(window);
+        let device_focused = self
+            .device_name
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window);
         let device_name = self.device_name.read(cx).as_str().trim().to_string();
         let name_hint = match validate_device_name(&device_name) {
             Ok(()) => format!("{}/25", device_name.chars().count()),
@@ -261,69 +269,89 @@ impl Render for Settings {
             .size_full()
             .flex()
             .flex_col()
-            .gap_4()
+            .gap(px(20.))
             .overflow_y_scroll()
-            .p_6()
-            .bg(colors.background)
-            .text_color(colors.text)
+            .p(px(24.))
+            .bg(theme.surface)
+            .text_sm()
+            .text_color(theme.text)
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap(px(6.))
                     .child(
                         div()
-                            .text_xl()
+                            .text_lg()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child("Openover"),
                     )
-                    .child(div().text_sm().text_color(colors.disabled).child(
+                    .child(div().text_color(theme.quiet).child(
                         "Inoffizieller Pushover Open Client. Passwort wird nicht gespeichert.",
                     )),
             )
-            .child(labeled(
-                "E-Mail",
-                text_field("email", self.email.downgrade(), "name@example.com", &colors),
-            ))
-            .child(labeled("Passwort", self.password.clone()))
-            .when(self.show_twofa, |form| {
-                form.child(labeled(
-                    "Zwei-Faktor-Code",
-                    text_field("twofa", self.twofa.downgrade(), "123456", &colors),
-                ))
-            })
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap(px(16.))
                     .child(labeled(
-                        "Gerätename",
+                        "E-Mail",
                         text_field(
-                            "device-name",
-                            self.device_name.downgrade(),
-                            DEFAULT_DEVICE_NAME,
-                            &colors,
+                            "email",
+                            self.email.downgrade(),
+                            "name@example.com",
+                            &theme,
+                            email_focused,
                         ),
                     ))
+                    .child(labeled("Passwort", self.password.clone()))
+                    .when(self.show_twofa, |form| {
+                        form.child(labeled(
+                            "Zwei-Faktor-Code",
+                            text_field(
+                                "twofa",
+                                self.twofa.downgrade(),
+                                "123456",
+                                &theme,
+                                twofa_focused,
+                            ),
+                        ))
+                    })
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(colors.disabled)
-                            .child(format!("{name_hint} · nur A–Z, a–z, 0–9, _ und -")),
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(labeled(
+                                "Gerätename",
+                                text_field(
+                                    "device-name",
+                                    self.device_name.downgrade(),
+                                    DEFAULT_DEVICE_NAME,
+                                    &theme,
+                                    device_focused,
+                                ),
+                            ))
+                            .child(
+                                div()
+                                    .text_color(theme.quiet)
+                                    .child(format!("{name_hint} · nur A–Z, a–z, 0–9, _ und -")),
+                            ),
                     ),
             )
             .child(
                 div()
                     .id("login")
-                    .self_start()
-                    .px_4()
-                    .py_2()
+                    .w_full()
+                    .h(field_height())
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .rounded_md()
-                    .bg(colors.selected)
-                    .text_color(colors.selected_text)
+                    .bg(theme.accent)
+                    .text_color(theme.on_accent)
                     .cursor_pointer()
-                    .when(self.busy, |button| button.opacity(0.65))
                     .child(button_label)
                     .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
             )
@@ -332,21 +360,24 @@ impl Render for Settings {
                     div()
                         .flex()
                         .flex_col()
-                        .gap_2()
-                        .p_3()
+                        .gap(px(12.))
+                        .p(px(12.))
                         .rounded_md()
                         .border_1()
-                        .border_color(colors.selected)
-                        .child(div().text_sm().child(title))
+                        .border_color(theme.border)
+                        .bg(theme.field)
+                        .child(div().child(title))
                         .child(
                             div()
                                 .id("ack-emergency")
-                                .self_start()
-                                .px_3()
-                                .py_1()
+                                .w_full()
+                                .h(field_height())
+                                .flex()
+                                .items_center()
+                                .justify_center()
                                 .rounded_md()
-                                .bg(colors.selected)
-                                .text_color(colors.selected_text)
+                                .bg(theme.accent)
+                                .text_color(theme.on_accent)
                                 .cursor_pointer()
                                 .child("Notfall bestätigen")
                                 .on_click(cx.listener(|this, _, _, cx| this.acknowledge(cx))),
@@ -355,21 +386,16 @@ impl Render for Settings {
             })
             .child(
                 div()
-                    .text_sm()
-                    .whitespace_normal()
-                    .child(self.status.clone()),
-            )
-            .child(
-                div()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .text_sm()
-                    .text_color(colors.disabled)
+                    .gap(px(8.))
+                    .text_color(theme.quiet)
+                    .child(div().whitespace_normal().child(self.status.clone()))
                     .child(
                         div()
                             .id("open-pushover")
                             .cursor_pointer()
+                            .underline()
                             .child("Account und Desktop-Lizenz auf pushover.net")
                             .on_click(|_, _, cx| {
                                 cx.open_url("https://pushover.net/clients/desktop")
@@ -379,6 +405,7 @@ impl Render for Settings {
                         div()
                             .id("open-signup")
                             .cursor_pointer()
+                            .underline()
                             .child("Noch kein Konto? pushover.net/signup")
                             .on_click(|_, _, cx| cx.open_url("https://pushover.net/signup")),
                     ),
@@ -390,8 +417,8 @@ fn labeled(label: &'static str, field: impl IntoElement) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
-        .gap_1()
-        .child(div().text_sm().child(label))
+        .gap(px(6.))
+        .child(div().child(label))
         .child(field)
 }
 
@@ -399,22 +426,20 @@ fn text_field(
     id: &'static str,
     state: gpui::WeakEntity<EditableTextState>,
     placeholder: &'static str,
-    colors: &Colors,
+    theme: &FormTheme,
+    focused: bool,
 ) -> impl IntoElement + use<> {
-    text_input(id)
-        .state(state)
-        .placeholder(placeholder)
-        .placeholder_color(colors.disabled)
-        .w_full()
-        .min_h_auto()
-        .whitespace_nowrap()
-        .overflow_x_scroll()
-        .px_3()
-        .py_2()
-        .rounded_md()
-        .border_1()
-        .border_color(colors.border)
-        .bg(colors.container)
+    field_chrome(div(), theme, focused).child(
+        text_input(id)
+            .state(state)
+            .placeholder(placeholder)
+            .placeholder_color(theme.placeholder)
+            .caret_color(rgb_to_hsla(theme.text))
+            .selection_color(theme.selection)
+            .w_full()
+            .whitespace_nowrap()
+            .overflow_x_scroll(),
+    )
 }
 
 fn show_toast(cx: &mut App, toast: &Toast) {
