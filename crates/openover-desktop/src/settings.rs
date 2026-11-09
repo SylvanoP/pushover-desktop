@@ -431,14 +431,16 @@ impl Render for Settings {
             )
             .child(match self.pane {
                 Pane::Account => account_pane(
-                    self,
-                    &theme,
-                    &email,
-                    &name_hint,
-                    email_focused,
-                    twofa_focused,
-                    device_focused,
-                    button_label,
+                    &AccountPane {
+                        settings: self,
+                        theme: &theme,
+                        email: &email,
+                        name_hint: &name_hint,
+                        email_focused,
+                        twofa_focused,
+                        device_focused,
+                        button_label,
+                    },
                     cx,
                 ),
                 Pane::Preferences => preferences_pane(self, &theme, &device_name, cx),
@@ -451,17 +453,29 @@ impl Render for Settings {
     }
 }
 
-fn account_pane(
-    settings: &Settings,
-    theme: &FormTheme,
-    email: &str,
-    name_hint: &str,
+#[derive(Clone, Copy)]
+struct AccountPane<'a> {
+    settings: &'a Settings,
+    theme: &'a FormTheme,
+    email: &'a str,
+    name_hint: &'a str,
     email_focused: bool,
     twofa_focused: bool,
     device_focused: bool,
     button_label: &'static str,
-    cx: &mut Context<Settings>,
-) -> gpui::Div {
+}
+
+fn account_pane(pane: &AccountPane<'_>, cx: &mut Context<Settings>) -> gpui::Div {
+    let AccountPane {
+        settings,
+        theme,
+        email,
+        name_hint,
+        email_focused,
+        twofa_focused,
+        device_focused,
+        button_label,
+    } = *pane;
     if settings.logged_in {
         return div()
             .flex()
