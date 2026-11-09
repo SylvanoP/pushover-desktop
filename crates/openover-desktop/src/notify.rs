@@ -23,12 +23,10 @@ pub fn present(cx: &mut App, notification: SystemNotification, launch: Option<St
     #[cfg(not(windows))]
     {
         let _ = (commands, launch);
-        let mut async_cx = cx.to_async();
+        let async_cx = cx.to_async();
         cx.foreground_executor()
             .spawn(async move {
-                async_cx
-                    .update(|cx| cx.show_system_notification(notification))
-                    .ok();
+                async_cx.update(|cx| cx.show_system_notification(notification));
             })
             .detach();
     }
