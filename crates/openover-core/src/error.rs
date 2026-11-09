@@ -16,6 +16,14 @@ pub enum ApiError {
     MessagesFailed { detail: String },
     #[error("delete messages failed: {detail}")]
     DeleteFailed { detail: String },
+    #[error("acknowledge failed: {detail}")]
+    AcknowledgeFailed { detail: String },
+    #[error("HTTP {status}: {body}")]
+    HttpStatus { status: u16, body: String },
+    #[error("invalid parameter")]
+    InvalidParameter,
+    #[error("{0}")]
+    DeviceName(#[from] crate::device_name::DeviceNameError),
     #[error("invalid JSON response: {0}")]
     Json(#[from] serde_json::Error),
 }

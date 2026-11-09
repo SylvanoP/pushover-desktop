@@ -8,12 +8,17 @@
 
 **English (short):** Unofficial Pushover **Open Client** desktop app (`os=O`). Not affiliated with Pushover LLC. Desktop license required per Pushover policy. MIT-licensed source; build from source today; GitHub Releases planned later.
 
-## Status (v0.1.0 scaffold)
+## Status (v0.1.0)
 
-- GPUI (`gpui-ce`) + `gpui-tray` shell
-- Rust crate `openover-core`: Login, Geräteregistrierung, Nachrichten-Typen, WebSocket-Skelett mit Reconnect
-- Credential-Speicher via OS-Keyring (`keyring`); Dev/CI: `OPENOVER_SECRET`, `OPENOVER_DEVICE_ID`, optional `OPENOVER_USER_KEY`
-- Kein vollständiges Onboarding, keine Historie, keine Installer-Releases in diesem Stand
+- GPUI (`gpui-ce`) + `gpui-tray`
+- Anmeldung im Einstellungsfenster (E-Mail, Passwort, optional 2FA, Gerätename)
+- `openover-core`: Login, Gerät `os=O`, Nachrichten, WebSocket mit Reconnect
+- Nach `!` werden neue Nachrichten als Systembenachrichtigung gezeigt (Titel, Text, App-Name)
+- Beim ersten Start wird eine große alte Warteschlange still verworfen; die letzte Nachrichten-ID liegt lokal
+- Zugangsdaten im OS-Keyring (`user key`, `secret`, `device id`). Das Passwort wird nicht gespeichert.
+- Keine Historie, keine Sounds, keine Bildanhänge
+
+Ohne gespeicherte Anmeldung öffnet sich das Fenster von selbst. Mit Anmeldung bleibt die App im Tray; Einstellungen liegen im Tray-Menü.
 
 ## Build (from source)
 
@@ -26,7 +31,7 @@ cargo run -- --demo-toast
 
 `--demo-toast` zeigt eine **Demo-Benachrichtigung** über die GPUI-Systemnotification-API (ohne Pushover-Account).
 
-Mit gespeicherten Credentials startet ein Hintergrund-WebSocket zu `wss://client.pushover.net/push` (Logging; vollständige Sync-UI folgt).
+Mit gespeicherten Zugangsdaten verbindet sich die App mit `wss://client.pushover.net/push`. Bei `!` holt sie Nachrichten per HTTPS und zeigt sie als Systembenachrichtigung.
 
 ## Entwicklung / CI
 

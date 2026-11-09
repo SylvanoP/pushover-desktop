@@ -15,6 +15,9 @@ tokio = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-channel = "0.3"
+futures-util = "0.3"
 gpui_ce_backend = { package = "gpui-ce", version = "0.3" }
 gpui_platform = { package = "gpui_ce_platform", version = "0.3" }
 gpui-tray = { version = "0.3", default-features = false, features = ["gpui-ce", "menu-state"] }
+gpui_ce_elements = "0.3"
