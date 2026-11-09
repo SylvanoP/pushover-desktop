@@ -801,7 +801,11 @@ fn message_row(
     .justify_between()
     .gap(px(8.))
     .on_click(cx.listener(move |this, _, _, cx| {
-        this.selected_id = Some(id);
+        this.selected_id = if this.selected_id == Some(id) {
+            None
+        } else {
+            Some(id)
+        };
         cx.notify();
     }))
     .child(
