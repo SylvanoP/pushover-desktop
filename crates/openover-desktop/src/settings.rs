@@ -26,14 +26,23 @@ impl Global for SettingsState {}
 impl Global for SettingsWindow {}
 impl Global for SessionCommands {}
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    Account,
+    Preferences,
+}
+
 pub struct Settings {
     email: Entity<EditableTextState>,
     password: Entity<MaskedPassword>,
     twofa: Entity<EditableTextState>,
     device_name: Entity<EditableTextState>,
+    pane: Pane,
     show_twofa: bool,
     busy: bool,
     logged_in: bool,
+    connection: Connection,
+    sound_enabled: bool,
     epoch: u64,
     status: SharedString,
     pending_emergency: Option<(String, String)>,
@@ -46,7 +55,8 @@ impl Settings {
         let password = cx.new(MaskedPassword::new);
         let twofa = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let device_name = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
-        let stored_name = LocalState::load()
+        let stored = LocalState::load();
+        let stored_name = stored
             .device_name
             .filter(|name| validate_device_name(name).is_ok())
             .unwrap_or_else(|| DEFAULT_DEVICE_NAME.to_string());
@@ -63,9 +73,12 @@ impl Settings {
             password,
             twofa,
             device_name,
+            pane: Pane::Account,
             show_twofa: false,
             busy: false,
             logged_in: false,
+            connection: Connection::SignedOut,
+            sound_enabled: stored.sound_enabled,
             epoch: 0,
             status: "Noch nicht angemeldet. Das Passwort wird nicht gespeichert.".into(),
             pending_emergency: None,
@@ -117,6 +130,26 @@ impl Settings {
         self.set_status("Anmeldung läuft…", cx);
     }
 
+    fn logout(&mut self, cx: &mut Context<Self>) {
+        let Some(commands) = cx.try_global::<SessionCommands>() else {
+            self.set_status("Abmelden ist noch nicht bereit.", cx);
+            return;
+        };
+        if commands.0.send(SessionCommand::Logout).is_err() {
+            self.set_status("Abmelden konnte nicht gestartet werden.", cx);
+        }
+    }
+
+    fn toggle_sound(&mut self, cx: &mut Context<Self>) {
+        self.sound_enabled = !self.sound_enabled;
+        let mut state = LocalState::load();
+        state.sound_enabled = self.sound_enabled;
+        if let Err(err) = state.save() {
+            tracing::warn!("could not store sound setting: {err}");
+        }
+        cx.notify();
+    }
+
     fn acknowledge(&mut self, cx: &mut Context<Self>) {
         let Some((receipt, _)) = self.pending_emergency.clone() else {
             return;
@@ -151,19 +184,18 @@ impl Settings {
                 self.busy = false;
                 self.status = format!("Anmeldung fehlgeschlagen: {detail}").into();
             }
-            SessionEvent::LoggedIn { epoch, device_id } => {
+            SessionEvent::LoggedIn { epoch } => {
                 if !self.accept_epoch(epoch) {
                     return false;
                 }
                 self.busy = false;
                 self.logged_in = true;
+                self.connection = Connection::Connecting;
+                self.pane = Pane::Account;
                 self.show_twofa = false;
                 self.password.update(cx, |password, cx| password.clear(cx));
                 self.twofa.update(cx, |twofa, cx| twofa.emplace("", cx));
-                self.status = format!(
-                    "Angemeldet. Gerät {device_id}. Das Passwort wurde aus dem Speicher gelöscht."
-                )
-                .into();
+                self.status = "Angemeldet. Das Passwort wurde aus dem Speicher gelöscht.".into();
             }
             SessionEvent::LoggedOut { epoch } => {
                 if !self.accept_epoch(epoch) {
@@ -171,6 +203,8 @@ impl Settings {
                 }
                 self.busy = false;
                 self.logged_in = false;
+                self.connection = Connection::SignedOut;
+                self.pane = Pane::Account;
                 self.pending_emergency = None;
                 self.status =
                     "Abgemeldet. Dasselbe Konto verwendet dieses Gerät beim nächsten Login wieder."
@@ -182,7 +216,7 @@ impl Settings {
                 if !self.accept_epoch(epoch) {
                     return false;
                 }
-                show_toast(cx, &toast);
+                show_toast(cx, &toast, self.sound_enabled);
                 if let Some(receipt) = toast.receipt.clone() {
                     self.pending_emergency = Some((receipt, toast.title.clone()));
                 }
@@ -201,6 +235,7 @@ impl Settings {
                 if !self.accept_epoch(epoch) {
                     return false;
                 }
+                self.connection = state;
                 crate::tray::set_tooltip_text(cx, state.tooltip());
             }
             SessionEvent::BacklogDropped { epoch, count } => {
@@ -219,6 +254,8 @@ impl Settings {
                 }
                 self.busy = false;
                 self.logged_in = false;
+                self.connection = Connection::SessionEnded;
+                self.pane = Pane::Account;
                 self.status = message.into();
                 crate::tray::set_tooltip_text(cx, Connection::SessionEnded.tooltip());
                 open_settings = true;
@@ -246,14 +283,15 @@ impl Render for Settings {
             .focus_handle(cx)
             .is_focused(window);
         let device_name = self.device_name.read(cx).as_str().trim().to_string();
+        let email = self.email.read(cx).as_str().trim().to_string();
         let name_hint = match validate_device_name(&device_name) {
             Ok(()) => format!("{}/25", device_name.chars().count()),
             Err(err) => err.to_string(),
         };
+        let account_tab = self.pane == Pane::Account;
+        let logged_in = self.logged_in;
         let button_label = if self.busy {
             "Anmeldung läuft…"
-        } else if self.logged_in {
-            "Erneut anmelden"
         } else {
             "Anmelden"
         };
@@ -262,7 +300,11 @@ impl Render for Settings {
             .id("openover-settings")
             .key_context("OpenoverSettings")
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "enter" && !this.busy {
+                if event.keystroke.key == "enter"
+                    && !this.busy
+                    && !this.logged_in
+                    && this.pane == Pane::Account
+                {
                     this.submit(cx);
                 }
             }))
@@ -293,124 +335,274 @@ impl Render for Settings {
             .child(
                 div()
                     .flex()
-                    .flex_col()
                     .gap(px(16.))
-                    .child(labeled(
-                        "E-Mail",
-                        text_field(
-                            "email",
-                            self.email.downgrade(),
-                            "name@example.com",
-                            &theme,
-                            email_focused,
-                        ),
-                    ))
-                    .child(labeled("Passwort", self.password.clone()))
-                    .when(self.show_twofa, |form| {
-                        form.child(labeled(
-                            "Zwei-Faktor-Code",
-                            text_field(
-                                "twofa",
-                                self.twofa.downgrade(),
-                                "123456",
-                                &theme,
-                                twofa_focused,
-                            ),
-                        ))
-                    })
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.))
-                            .child(labeled(
-                                "Gerätename",
-                                text_field(
-                                    "device-name",
-                                    self.device_name.downgrade(),
-                                    DEFAULT_DEVICE_NAME,
-                                    &theme,
-                                    device_focused,
-                                ),
-                            ))
-                            .child(
-                                div()
-                                    .text_color(theme.quiet)
-                                    .child(format!("{name_hint} · nur A–Z, a–z, 0–9, _ und -")),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .id("login")
-                    .w_full()
-                    .h(field_height())
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .bg(theme.accent)
-                    .text_color(theme.on_accent)
-                    .cursor_pointer()
-                    .child(button_label)
-                    .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
-            )
-            .when_some(self.pending_emergency.clone(), |form, (_, title)| {
-                form.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(12.))
-                        .p(px(12.))
-                        .rounded_md()
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.field)
-                        .child(div().child(title))
-                        .child(
-                            div()
-                                .id("ack-emergency")
-                                .w_full()
-                                .h(field_height())
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_md()
-                                .bg(theme.accent)
-                                .text_color(theme.on_accent)
-                                .cursor_pointer()
-                                .child("Notfall bestätigen")
-                                .on_click(cx.listener(|this, _, _, cx| this.acknowledge(cx))),
-                        ),
-                )
-            })
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .text_color(theme.quiet)
-                    .child(div().whitespace_normal().child(self.status.clone()))
-                    .child(
-                        div()
-                            .id("open-pushover")
-                            .cursor_pointer()
-                            .underline()
-                            .child("Account und Desktop-Lizenz auf pushover.net")
-                            .on_click(|_, _, cx| {
-                                cx.open_url("https://pushover.net/clients/desktop")
+                        tab_button("tab-account", "Konto", account_tab, &theme).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.pane = Pane::Account;
+                                cx.notify();
                             }),
+                        ),
                     )
                     .child(
-                        div()
-                            .id("open-signup")
-                            .cursor_pointer()
-                            .underline()
-                            .child("Noch kein Konto? pushover.net/signup")
-                            .on_click(|_, _, cx| cx.open_url("https://pushover.net/signup")),
+                        tab_button("tab-preferences", "Einstellungen", !account_tab, &theme)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.pane = Pane::Preferences;
+                                cx.notify();
+                            })),
                     ),
             )
+            .child(if account_tab {
+                account_pane(
+                    self,
+                    &theme,
+                    &email,
+                    &name_hint,
+                    email_focused,
+                    twofa_focused,
+                    device_focused,
+                    button_label,
+                    cx,
+                )
+            } else {
+                preferences_pane(self, &theme, &device_name, cx)
+            })
+            .when_some(self.pending_emergency.clone(), |form, (_, title)| {
+                form.child(emergency_card(title, &theme, cx))
+            })
+            .child(footer(self.status.clone(), &theme, logged_in))
     }
+}
+
+fn account_pane(
+    settings: &Settings,
+    theme: &FormTheme,
+    email: &str,
+    name_hint: &str,
+    email_focused: bool,
+    twofa_focused: bool,
+    device_focused: bool,
+    button_label: &'static str,
+    cx: &mut Context<Settings>,
+) -> gpui::Div {
+    if settings.logged_in {
+        return div()
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("Angemeldet"),
+                    )
+                    .when(!email.is_empty(), |block| {
+                        block.child(div().child(email.to_string()))
+                    })
+                    .child(div().text_color(theme.quiet).child(
+                        "Die Sitzung bleibt auf diesem PC. Das Passwort ist nicht gespeichert.",
+                    )),
+            )
+            .child(
+                primary_button("logout", "Abmelden", theme)
+                    .on_click(cx.listener(|this, _, _, cx| this.logout(cx))),
+            );
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(16.))
+        .child(labeled(
+            "E-Mail",
+            text_field(
+                "email",
+                settings.email.downgrade(),
+                "name@example.com",
+                theme,
+                email_focused,
+            ),
+        ))
+        .child(labeled("Passwort", settings.password.clone()))
+        .when(settings.show_twofa, |form| {
+            form.child(labeled(
+                "Zwei-Faktor-Code",
+                text_field(
+                    "twofa",
+                    settings.twofa.downgrade(),
+                    "123456",
+                    theme,
+                    twofa_focused,
+                ),
+            ))
+        })
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(labeled(
+                    "Gerätename",
+                    text_field(
+                        "device-name",
+                        settings.device_name.downgrade(),
+                        DEFAULT_DEVICE_NAME,
+                        theme,
+                        device_focused,
+                    ),
+                ))
+                .child(
+                    div()
+                        .text_color(theme.quiet)
+                        .child(format!("{name_hint} · nur A–Z, a–z, 0–9, _ und -")),
+                ),
+        )
+        .child(
+            primary_button("login", button_label, theme)
+                .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
+        )
+}
+
+fn preferences_pane(
+    settings: &Settings,
+    theme: &FormTheme,
+    device_name: &str,
+    cx: &mut Context<Settings>,
+) -> gpui::Div {
+    let shown_name = if device_name.is_empty() {
+        "noch nicht festgelegt".to_string()
+    } else {
+        device_name.to_string()
+    };
+    let sound_label = if settings.sound_enabled { "An" } else { "Aus" };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(16.))
+        .child(labeled(
+            "Verbindung",
+            field_chrome(div(), theme, false).child(settings.connection.label()),
+        ))
+        .child(labeled(
+            "Ton",
+            field_chrome(div().id("sound-toggle"), theme, settings.sound_enabled)
+                .cursor_pointer()
+                .justify_between()
+                .child("Benachrichtigungston")
+                .child(
+                    div()
+                        .text_color(if settings.sound_enabled {
+                            theme.accent
+                        } else {
+                            theme.quiet
+                        })
+                        .child(sound_label),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_sound(cx))),
+        ))
+        .child(labeled(
+            "Gerätename",
+            field_chrome(div(), theme, false).child(shown_name),
+        ))
+        .child(
+            div()
+                .text_color(theme.quiet)
+                .child("Der Gerätename wird beim Anmelden festgelegt."),
+        )
+}
+
+fn emergency_card(
+    title: String,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.))
+        .p(px(12.))
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.field)
+        .child(div().child(title))
+        .child(
+            primary_button("ack-emergency", "Notfall bestätigen", theme)
+                .on_click(cx.listener(|this, _, _, cx| this.acknowledge(cx))),
+        )
+}
+
+fn footer(status: SharedString, theme: &FormTheme, _logged_in: bool) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .text_color(theme.quiet)
+        .when(!status.is_empty(), |footer| {
+            footer.child(div().whitespace_normal().child(status))
+        })
+        .child(
+            div()
+                .id("open-pushover")
+                .cursor_pointer()
+                .underline()
+                .child("Account und Desktop-Lizenz auf pushover.net")
+                .on_click(|_, _, cx| cx.open_url("https://pushover.net/clients/desktop")),
+        )
+        .child(
+            div()
+                .id("open-signup")
+                .cursor_pointer()
+                .underline()
+                .child("Noch kein Konto? pushover.net/signup")
+                .on_click(|_, _, cx| cx.open_url("https://pushover.net/signup")),
+        )
+}
+
+fn tab_button(
+    id: &'static str,
+    label: &'static str,
+    active: bool,
+    theme: &FormTheme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(6.))
+        .cursor_pointer()
+        .text_color(if active { theme.text } else { theme.quiet })
+        .child(label)
+        .child(div().w(px(28.)).h(px(2.)).rounded_md().bg(if active {
+            theme.accent
+        } else {
+            theme.surface
+        }))
+}
+
+fn primary_button(
+    id: &'static str,
+    label: &'static str,
+    theme: &FormTheme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .w_full()
+        .h(field_height())
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .bg(theme.accent)
+        .text_color(theme.on_accent)
+        .cursor_pointer()
+        .child(label)
 }
 
 fn labeled(label: &'static str, field: impl IntoElement) -> impl IntoElement {
@@ -442,7 +634,7 @@ fn text_field(
     )
 }
 
-fn show_toast(cx: &mut App, toast: &Toast) {
+fn show_toast(cx: &mut App, toast: &Toast, sound_enabled: bool) {
     let mut actions = Vec::new();
     if let Some(receipt) = &toast.receipt {
         actions.push(SystemNotificationAction {
@@ -450,19 +642,22 @@ fn show_toast(cx: &mut App, toast: &Toast) {
             label: "Bestätigen".into(),
         });
     }
-    if let Some(path) = &toast.sound_path {
+    if sound_enabled && let Some(path) = &toast.sound_path {
         crate::sound::play(path.clone());
     }
-    cx.show_system_notification(SystemNotification {
-        tag: format!("openover-{}", toast.message_id).into(),
-        title: toast.title.clone().into(),
-        body: toast.body.clone().into(),
-        actions,
-    });
+    crate::notify::present(
+        cx,
+        SystemNotification {
+            tag: format!("openover-{}", toast.message_id).into(),
+            title: toast.title.clone().into(),
+            body: toast.body.clone().into(),
+            actions,
+        },
+    );
 }
 
 fn show_backlog_toast(cx: &mut App, count: usize) {
-    cx.show_system_notification(SystemNotification {
+    crate::notify::present(cx, SystemNotification {
         tag: "openover-backlog".into(),
         title: "Ältere Nachrichten verworfen".into(),
         body: format!(
@@ -480,6 +675,22 @@ fn send_acknowledge(cx: &mut App, receipt: &str) {
     let _ = commands.0.send(SessionCommand::Acknowledge {
         receipt: receipt.to_string(),
     });
+}
+
+fn window_title(logged_in: bool) -> &'static str {
+    if logged_in {
+        "Openover"
+    } else {
+        "Openover — Anmeldung"
+    }
+}
+
+fn refresh_window_title(logged_in: bool, cx: &mut App) {
+    let Some(SettingsWindow(handle)) = cx.try_global::<SettingsWindow>().copied() else {
+        return;
+    };
+    let title = window_title(logged_in);
+    let _ = handle.update(cx, |_, window, _| window.set_window_title(title));
 }
 
 fn settings_entity(cx: &mut App) -> Entity<Settings> {
@@ -503,6 +714,7 @@ pub fn install(cx: &mut App) {
     if has_session {
         settings.update(cx, |this, cx| {
             this.logged_in = true;
+            this.connection = Connection::Connecting;
             this.status = "Gespeicherte Anmeldung gefunden. Verbinde…".into();
             cx.notify();
         });
@@ -529,7 +741,10 @@ pub fn install(cx: &mut App) {
         while let Some(event) = incoming.next().await {
             let open_settings = cx.update(|cx| {
                 let settings = settings_entity(cx);
-                settings.update(cx, |settings, cx| settings.apply(event, cx))
+                let open_settings = settings.update(cx, |settings, cx| settings.apply(event, cx));
+                let logged_in = settings.read(cx).logged_in;
+                refresh_window_title(logged_in, cx);
+                open_settings
             });
             if open_settings {
                 cx.update(open_settings_window);
@@ -556,7 +771,7 @@ pub fn open_settings_window(cx: &mut App) {
         WindowOptions::default()
             .window_bounds(WindowBounds::Windowed(bounds))
             .titlebar(Some(TitlebarOptions {
-                title: Some("Openover — Anmeldung".into()),
+                title: Some(window_title(view.read(cx).logged_in).into()),
                 ..Default::default()
             })),
         move |window, cx| {

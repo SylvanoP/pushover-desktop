@@ -21,3 +21,7 @@ gpui_ce_backend = { package = "gpui-ce", version = "0.3" }
 gpui_platform = { package = "gpui_ce_platform", version = "0.3" }
 gpui-tray = { version = "0.3", default-features = false, features = ["gpui-ce", "menu-state"] }
 gpui_ce_elements = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Foundation", "UI_Notifications", "Data_Xml_Dom"] }
+windows-registry = "0.6"

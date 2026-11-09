@@ -17,7 +17,7 @@ pub struct PendingEmergency {
     pub sound: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalState {
     #[serde(default)]
     pub last_message_id: Option<u64>,
@@ -31,6 +31,26 @@ pub struct LocalState {
     pub shown_through: Option<u64>,
     #[serde(default)]
     pub emergencies: Vec<PendingEmergency>,
+    /// When false, message toasts stay silent. Missing keys stay on.
+    #[serde(default = "sound_enabled_by_default")]
+    pub sound_enabled: bool,
+}
+
+fn sound_enabled_by_default() -> bool {
+    true
+}
+
+impl Default for LocalState {
+    fn default() -> Self {
+        Self {
+            last_message_id: None,
+            device_name: None,
+            held_from: None,
+            shown_through: None,
+            emergencies: Vec::new(),
+            sound_enabled: true,
+        }
+    }
 }
 
 impl PendingEmergency {
@@ -139,6 +159,7 @@ mod tests {
                 receipt: "receipt-1".into(),
                 sound: Some("siren".into()),
             }],
+            sound_enabled: true,
         };
         state.write(&path).unwrap();
         let loaded = LocalState::read(&path).unwrap();

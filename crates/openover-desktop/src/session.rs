@@ -47,13 +47,24 @@ impl Connection {
             Self::SessionEnded => "Openover — Sitzung beendet, bitte erneut anmelden",
         }
     }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SignedOut => "Nicht angemeldet",
+            Self::Connecting => "Verbinde…",
+            Self::Connected => "Verbunden",
+            Self::Reconnecting => "Verbindung unterbrochen, neuer Versuch…",
+            Self::SyncFailed => "Nachrichtenabruf fehlgeschlagen",
+            Self::SessionEnded => "Sitzung beendet",
+        }
+    }
 }
 
 pub enum SessionEvent {
     Status(String),
     TwoFactorRequired,
     LoginFailed(String),
-    LoggedIn { epoch: u64, device_id: String },
+    LoggedIn { epoch: u64 },
     LoggedOut { epoch: u64 },
     Notify { epoch: u64, toast: Toast },
     EmergencyAcknowledged { receipt: String },
@@ -253,12 +264,9 @@ impl Live {
         }
 
         self.adopt(&creds);
-        let device_id = creds.device_id.clone();
         self.spawn_push(creds);
         let epoch = self.generation.load(Ordering::SeqCst);
-        let _ = self
-            .events
-            .unbounded_send(SessionEvent::LoggedIn { epoch, device_id });
+        let _ = self.events.unbounded_send(SessionEvent::LoggedIn { epoch });
     }
 
     async fn acknowledge(&self, receipt: &str) {
@@ -367,10 +375,7 @@ async fn run_push(push: PushRun) {
             } else if report.discarded == 0 {
                 send(
                     &events,
-                    SessionEvent::Status(format!(
-                        "Gerät {}. Warte auf die Push-Verbindung.",
-                        creds.device_id
-                    )),
+                    SessionEvent::Status("Warte auf die Push-Verbindung.".into()),
                 );
             }
         }
@@ -425,10 +430,10 @@ async fn run_push(push: PushRun) {
                         if fetch_ok {
                             send(
                                 &events,
-                                SessionEvent::Status(format!(
-                                    "Verbunden. Gerät {}. Neue Nachrichten erscheinen als Benachrichtigung.",
-                                    creds.device_id
-                                )),
+                                SessionEvent::Status(
+                                    "Verbunden. Neue Nachrichten erscheinen als Benachrichtigung."
+                                        .into(),
+                                ),
                             );
                         }
                     }

@@ -1,5 +1,6 @@
 mod form_theme;
 mod instance;
+mod notify;
 mod password_field;
 mod session;
 mod settings;
@@ -93,10 +94,13 @@ fn play_sound_code(code: String) {
 }
 
 fn show_demo_notification(cx: &mut App) {
-    cx.show_system_notification(SystemNotification {
-        tag: DEMO_NOTIFICATION_TAG.into(),
-        title: "Openover (Demo)".into(),
-        body: "Inoffizieller Pushover Open Client — Scaffold v0.1.0".into(),
-        actions: vec![],
-    });
+    notify::present(
+        cx,
+        SystemNotification {
+            tag: DEMO_NOTIFICATION_TAG.into(),
+            title: "Openover (Demo)".into(),
+            body: "Inoffizieller Pushover Open Client — Scaffold v0.1.0".into(),
+            actions: vec![],
+        },
+    );
 }

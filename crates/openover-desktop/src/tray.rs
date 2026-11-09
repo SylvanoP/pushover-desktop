@@ -44,10 +44,18 @@ fn logout(_: &Logout, cx: &mut App) {
 }
 
 pub fn set_tooltip_text(cx: &mut App, text: &str) {
-    let Some(tray) = cx.try_global::<AppTray>().map(|tray| tray.0.clone()) else {
-        return;
-    };
-    let _ = tray.set_tooltip(Some(text.to_string()), cx);
+    let text = text.to_string();
+    let async_cx = cx.to_async();
+    cx.foreground_executor()
+        .spawn(async move {
+            async_cx.update(|cx| {
+                let Some(tray) = cx.try_global::<AppTray>().map(|tray| tray.0.clone()) else {
+                    return;
+                };
+                let _ = tray.set_tooltip(Some(text), cx);
+            });
+        })
+        .detach();
 }
 
 fn quit(_: &Quit, cx: &mut App) {
