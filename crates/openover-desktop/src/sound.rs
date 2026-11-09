@@ -2,8 +2,23 @@
 
 use std::path::PathBuf;
 
-pub fn play(path: PathBuf) {
-    playback::play(path);
+pub fn play(path: PathBuf, volume: u8) {
+    if volume == 0 {
+        return;
+    }
+    playback::play(path, volume);
+}
+
+/// Blocks until playback finishes. Used by `--play-sound` so the process can exit after the file.
+pub fn play_and_wait(path: PathBuf, volume: u8) {
+    if volume == 0 {
+        return;
+    }
+    playback::play_and_wait(path, volume);
+}
+
+pub fn mci_volume(volume: u8) -> u32 {
+    u32::from(volume.min(100)) * 10
 }
 
 #[cfg(windows)]
@@ -17,25 +32,36 @@ mod playback {
         fn mciSendStringW(command: *const u16, ret: *mut u16, ret_len: u32, hwnd: isize) -> u32;
     }
 
-    pub fn play(path: PathBuf) {
+    struct Cue {
+        path: PathBuf,
+        volume: u8,
+    }
+
+    pub fn play(path: PathBuf, volume: u8) {
         let Some(tx) = sender() else {
             return;
         };
-        let _ = tx.send(path);
+        let _ = tx.send(Cue { path, volume });
     }
 
-    fn sender() -> Option<&'static Sender<PathBuf>> {
-        static TX: OnceLock<Sender<PathBuf>> = OnceLock::new();
+    pub fn play_and_wait(path: PathBuf, volume: u8) {
+        if let Err(code) = play_blocking(&path, volume) {
+            tracing::warn!("could not play sound (mci {code})");
+        }
+    }
+
+    fn sender() -> Option<&'static Sender<Cue>> {
+        static TX: OnceLock<Sender<Cue>> = OnceLock::new();
         let tx = TX.get_or_init(|| {
-            let (tx, rx) = mpsc::channel::<PathBuf>();
+            let (tx, rx) = mpsc::channel::<Cue>();
             let started = std::thread::Builder::new()
                 .name("openover-sound".into())
                 .spawn(move || {
-                    while let Ok(mut path) = rx.recv() {
+                    while let Ok(mut cue) = rx.recv() {
                         while let Ok(newer) = rx.try_recv() {
-                            path = newer;
+                            cue = newer;
                         }
-                        if let Err(code) = play_blocking(&path) {
+                        if let Err(code) = play_blocking(&cue.path, cue.volume) {
                             tracing::warn!("could not play sound (mci {code})");
                         }
                     }
@@ -49,7 +75,7 @@ mod playback {
         Some(tx)
     }
 
-    fn play_blocking(path: &Path) -> Result<(), u32> {
+    fn play_blocking(path: &Path, volume: u8) -> Result<(), u32> {
         let path = short_enough(path);
         let text = path.to_string_lossy();
         if text.contains('"') {
@@ -58,6 +84,10 @@ mod playback {
         let _ = command("close oo");
         if command(&format!("open \"{text}\" type mpegvideo alias oo")).is_err() {
             command(&format!("open \"{text}\" alias oo"))?;
+        }
+        let factor = super::mci_volume(volume);
+        if let Err(code) = command(&format!("setaudio oo volume to {factor}")) {
+            tracing::warn!("could not set sound volume (mci {code})");
         }
         let played = command("play oo wait");
         let _ = command("close oo");
@@ -88,7 +118,24 @@ mod playback {
 mod playback {
     use std::path::PathBuf;
 
-    pub fn play(_path: PathBuf) {
+    pub fn play(_path: PathBuf, _volume: u8) {
         tracing::info!("sound playback is implemented on Windows only");
+    }
+
+    pub fn play_and_wait(path: PathBuf, volume: u8) {
+        play(path, volume);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mci_volume;
+
+    #[test]
+    fn volume_maps_onto_the_mci_range() {
+        assert_eq!(mci_volume(0), 0);
+        assert_eq!(mci_volume(40), 400);
+        assert_eq!(mci_volume(100), 1000);
+        assert_eq!(mci_volume(255), 1000);
     }
 }

@@ -8,7 +8,7 @@ use gpui::{App, SystemNotification};
 
 use crate::session::SessionCommands;
 
-pub fn present(cx: &mut App, notification: SystemNotification) {
+pub fn present(cx: &mut App, notification: SystemNotification, launch: Option<String>) {
     let commands = cx
         .try_global::<SessionCommands>()
         .map(|commands| commands.0.clone());
@@ -16,13 +16,13 @@ pub fn present(cx: &mut App, notification: SystemNotification) {
     {
         cx.foreground_executor()
             .spawn(async move {
-                windows_toast::show(notification, commands);
+                windows_toast::show(notification, launch, commands);
             })
             .detach();
     }
     #[cfg(not(windows))]
     {
-        let _ = commands;
+        let _ = (commands, launch);
         let mut async_cx = cx.to_async();
         cx.foreground_executor()
             .spawn(async move {
@@ -64,12 +64,13 @@ mod windows_toast {
 
     pub fn show(
         notification: SystemNotification,
+        launch: Option<String>,
         commands: Option<mpsc::UnboundedSender<SessionCommand>>,
     ) {
         let Some(notifier) = notifier() else {
             return;
         };
-        let Ok(document) = toast_document(&notification) else {
+        let Ok(document) = toast_document(&notification, launch.as_deref()) else {
             tracing::warn!("could not build toast");
             return;
         };
@@ -88,13 +89,18 @@ mod windows_toast {
                         .and_then(|arguments| arguments.Arguments().ok())
                         .filter(|arguments| !arguments.is_empty())
                         .map(|arguments| arguments.to_string());
-                    if let Some(receipt) = action_id
-                        .as_deref()
-                        .and_then(|action| action.strip_prefix("ack:"))
-                    {
-                        let _ = commands.send(SessionCommand::Acknowledge {
-                            receipt: receipt.to_string(),
-                        });
+                    match action_id.as_deref().map(str::trim) {
+                        Some(action) if let Some(receipt) = action.strip_prefix("ack:") => {
+                            if !receipt.is_empty() {
+                                let _ = commands.send(SessionCommand::Acknowledge {
+                                    receipt: receipt.to_string(),
+                                });
+                            }
+                        }
+                        Some(action) if let Ok(id) = action.parse::<u64>() => {
+                            let _ = commands.send(SessionCommand::OpenMessage { id });
+                        }
+                        _ => {}
                     }
                     Ok(())
                 },
@@ -148,9 +154,15 @@ mod windows_toast {
         }
     }
 
-    fn toast_document(notification: &SystemNotification) -> windows::core::Result<XmlDocument> {
+    fn toast_document(
+        notification: &SystemNotification,
+        launch: Option<&str>,
+    ) -> windows::core::Result<XmlDocument> {
         let document = XmlDocument::new()?;
         let toast = document.CreateElement(h!("toast"))?;
+        if let Some(launch) = launch.filter(|launch| !launch.is_empty()) {
+            toast.SetAttribute(h!("launch"), &launch.into())?;
+        }
         document.AppendChild(&toast)?;
         let visual = document.CreateElement(h!("visual"))?;
         toast.AppendChild(&visual)?;

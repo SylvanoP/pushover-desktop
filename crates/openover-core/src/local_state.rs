@@ -34,10 +34,21 @@ pub struct LocalState {
     /// When false, message toasts stay silent. Missing keys stay on.
     #[serde(default = "sound_enabled_by_default")]
     pub sound_enabled: bool,
+    /// Playback level from 0 to 100. Missing keys stay at full volume.
+    #[serde(default = "sound_volume_by_default")]
+    pub sound_volume: u8,
 }
 
 fn sound_enabled_by_default() -> bool {
     true
+}
+
+fn sound_volume_by_default() -> u8 {
+    100
+}
+
+pub fn clamp_volume(volume: u8) -> u8 {
+    volume.min(100)
 }
 
 impl Default for LocalState {
@@ -49,6 +60,7 @@ impl Default for LocalState {
             shown_through: None,
             emergencies: Vec::new(),
             sound_enabled: true,
+            sound_volume: 100,
         }
     }
 }
@@ -160,11 +172,21 @@ mod tests {
                 sound: Some("siren".into()),
             }],
             sound_enabled: true,
+            sound_volume: 40,
         };
         state.write(&path).unwrap();
         let loaded = LocalState::read(&path).unwrap();
         assert_eq!(loaded, state);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_sound_fields_stay_on_and_full() {
+        let state: LocalState = serde_json::from_str("{}").unwrap();
+        assert!(state.sound_enabled);
+        assert_eq!(state.sound_volume, 100);
+        assert_eq!(super::clamp_volume(140), 100);
+        assert_eq!(super::clamp_volume(0), 0);
     }
 
     #[test]

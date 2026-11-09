@@ -205,6 +205,10 @@ fn toast_for(message: &Message) -> Toast {
     }
 }
 
+pub(crate) fn plain_message_text(message: &Message) -> String {
+    plain_body(&message.message, message.html == Some(1))
+}
+
 fn plain_body(message: &str, html: bool) -> String {
     if html {
         strip_tags(message)
@@ -260,6 +264,7 @@ mod tests {
             html: None,
             acked: None,
             receipt: None,
+            date: None,
         }
     }
 

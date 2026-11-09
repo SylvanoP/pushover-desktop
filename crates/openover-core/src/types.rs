@@ -60,6 +60,9 @@ pub struct Message {
     pub acked: Option<i32>,
     #[serde(default)]
     pub receipt: Option<String>,
+    /// Unix time in seconds, when Pushover sent `date`.
+    #[serde(default)]
+    pub date: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

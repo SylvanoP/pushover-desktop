@@ -5,7 +5,8 @@ use std::time::Duration;
 use futures_channel::mpsc::UnboundedSender;
 use openover_core::{
     ApiError, CredentialStore, LocalState, PendingEmergency, PushLoop, PushLoopEvent,
-    PushoverClient, StoredCredentials, Toast, cursor_after_delete, plan_sync, wipe_secret,
+    PushoverClient, StoredCredentials, Toast, append_message_log, clamp_volume,
+    cursor_after_delete, entries_for_toasts, plan_sync, wipe_secret,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -24,6 +25,13 @@ pub enum SessionCommand {
         receipt: String,
     },
     Logout,
+    SetSound {
+        enabled: bool,
+        volume: u8,
+    },
+    OpenMessage {
+        id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +80,7 @@ pub enum SessionEvent {
     BacklogDropped { epoch: u64, count: usize },
     SessionLost { epoch: u64, message: String },
     Activate,
+    OpenMessage { id: u64 },
 }
 
 pub fn start(
@@ -146,6 +155,10 @@ async fn session_main(
             }
             SessionCommand::Acknowledge { receipt } => live.acknowledge(&receipt).await,
             SessionCommand::Logout => live.logout().await,
+            SessionCommand::SetSound { enabled, volume } => live.set_sound(enabled, volume),
+            SessionCommand::OpenMessage { id } => {
+                let _ = live.events.unbounded_send(SessionEvent::OpenMessage { id });
+            }
         }
     }
 }
@@ -294,6 +307,15 @@ impl Live {
                     "Bestätigung fehlgeschlagen: {err}"
                 )));
             }
+        }
+    }
+
+    fn set_sound(&self, enabled: bool, volume: u8) {
+        let mut state = lock_state(&self.state);
+        state.sound_enabled = enabled;
+        state.sound_volume = clamp_volume(volume);
+        if let Err(err) = state.save() {
+            tracing::warn!("could not store sound setting: {err}");
         }
     }
 
@@ -541,6 +563,14 @@ async fn sync_messages(
         shown_through,
         startup,
     );
+
+    if still_current(flag, epoch) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        append_message_log(&entries_for_toasts(&messages, &plan.toasts, now));
+    }
 
     let mut emergencies = Vec::new();
     for toast in plan.toasts {

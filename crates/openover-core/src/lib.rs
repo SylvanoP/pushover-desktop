@@ -5,6 +5,7 @@ mod credentials;
 mod device_name;
 mod error;
 mod local_state;
+mod message_log;
 mod password_mask;
 mod sound;
 mod sync;
@@ -17,7 +18,11 @@ pub use device_name::{
     DEFAULT_DEVICE_NAME, DeviceNameError, MAX_DEVICE_NAME_LEN, validate_device_name,
 };
 pub use error::{ApiError, CredentialError, WebSocketError};
-pub use local_state::{LocalState, PendingEmergency, default_state_path};
+pub use local_state::{LocalState, PendingEmergency, clamp_volume, default_state_path};
+pub use message_log::{
+    LoggedMessage, append_message_log, clear_message_log, entries_for_toasts, load_message_log,
+    messages_path,
+};
 pub use password_mask::{
     MAX_PASSWORD_CHARS, PASSWORD_BULLET, apply_masked_replace, mask_password, wipe_secret,
 };

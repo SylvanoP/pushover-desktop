@@ -40,8 +40,12 @@ fn main() {
 
     let cli = Cli::parse();
     if !instance::claim_primary() {
+        if let Some(code) = cli.play_sound.clone() {
+            play_sound_code(&code, true);
+        } else {
+            eprintln!("Openover läuft bereits.");
+        }
         instance::signal_running_instance();
-        eprintln!("Openover läuft bereits.");
         return;
     }
 
@@ -62,34 +66,49 @@ fn main() {
                 show_demo_notification(cx);
             }
             if let Some(code) = cli.play_sound.clone() {
-                play_sound_code(code);
+                play_sound_code(&code, false);
             }
         });
 }
 
-fn play_sound_code(code: String) {
-    std::thread::Builder::new()
-        .name("openover-sound-fetch".into())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            let Ok(runtime) = runtime else {
+fn play_sound_code(code: &str, wait: bool) {
+    let code = code.to_string();
+    let volume = openover_core::clamp_volume(openover_core::LocalState::load().sound_volume);
+    let run = move || {
+        if volume == 0 {
+            tracing::info!("sound {code} stays silent because volume is 0");
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        let Ok(runtime) = runtime else {
+            return;
+        };
+        runtime.block_on(async move {
+            let Ok(client) = openover_core::PushoverClient::new() else {
                 return;
             };
-            runtime.block_on(async move {
-                let Ok(client) = openover_core::PushoverClient::new() else {
-                    return;
-                };
-                match client.cache_sound(&code).await {
-                    Ok(path) => {
-                        tracing::info!("playing sound {code}");
-                        sound::play(path);
+            match client.cache_sound(&code).await {
+                Ok(path) => {
+                    tracing::info!("playing sound {code} at volume {volume}");
+                    if wait {
+                        sound::play_and_wait(path, volume);
+                    } else {
+                        sound::play(path, volume);
                     }
-                    Err(err) => tracing::warn!("could not play sound {code}: {err}"),
                 }
-            });
-        })
+                Err(err) => tracing::warn!("could not play sound {code}: {err}"),
+            }
+        });
+    };
+    if wait {
+        run();
+        return;
+    }
+    std::thread::Builder::new()
+        .name("openover-sound-fetch".into())
+        .spawn(run)
         .ok();
 }
 
@@ -102,5 +121,6 @@ fn show_demo_notification(cx: &mut App) {
             body: "Inoffizieller Pushover Open Client — Scaffold v0.1.0".into(),
             actions: vec![],
         },
+        None,
     );
 }

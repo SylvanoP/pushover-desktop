@@ -4,9 +4,10 @@ use crate::session::{Connection, SessionCommand, SessionCommands, SessionEvent};
 
 use futures_util::StreamExt as _;
 use gpui::{
-    App, Bounds, Context, Entity, Focusable, Global, KeyDownEvent, SharedString, Subscription,
-    SystemNotification, SystemNotificationAction, TitlebarOptions, Window, WindowBounds,
-    WindowHandle, WindowOptions, div, prelude::*, px, rgb_to_hsla, size,
+    App, Bounds, Context, DispatchPhase, Entity, Focusable, Global, Hitbox, KeyDownEvent,
+    MouseButton, MouseMoveEvent, Pixels, Point, SharedString, Subscription, SystemNotification,
+    SystemNotificationAction, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
+    div, prelude::*, px, relative, rgb_to_hsla, size,
 };
 use gpui_ce_elements::editable_text::{
     EditableTextState, StringStorage, TextChanged,
@@ -14,7 +15,8 @@ use gpui_ce_elements::editable_text::{
     text_input,
 };
 use openover_core::{
-    CredentialStore, DEFAULT_DEVICE_NAME, LocalState, Toast, validate_device_name,
+    CredentialStore, DEFAULT_DEVICE_NAME, LocalState, LoggedMessage, Toast, clamp_volume,
+    validate_device_name,
 };
 
 struct SettingsState(Entity<Settings>);
@@ -30,6 +32,7 @@ impl Global for SessionCommands {}
 enum Pane {
     Account,
     Preferences,
+    Messages,
 }
 
 pub struct Settings {
@@ -43,6 +46,11 @@ pub struct Settings {
     logged_in: bool,
     connection: Connection,
     sound_enabled: bool,
+    sound_volume: u8,
+    dragging_volume: bool,
+    volume_bounds: Option<Bounds<Pixels>>,
+    messages: Vec<LoggedMessage>,
+    selected_id: Option<u64>,
     epoch: u64,
     status: SharedString,
     pending_emergency: Option<(String, String)>,
@@ -79,6 +87,11 @@ impl Settings {
             logged_in: false,
             connection: Connection::SignedOut,
             sound_enabled: stored.sound_enabled,
+            sound_volume: clamp_volume(stored.sound_volume),
+            dragging_volume: false,
+            volume_bounds: None,
+            messages: openover_core::load_message_log(),
+            selected_id: None,
             epoch: 0,
             status: "Noch nicht angemeldet. Das Passwort wird nicht gespeichert.".into(),
             pending_emergency: None,
@@ -142,11 +155,51 @@ impl Settings {
 
     fn toggle_sound(&mut self, cx: &mut Context<Self>) {
         self.sound_enabled = !self.sound_enabled;
+        self.persist_sound(cx);
+        cx.notify();
+    }
+
+    fn persist_sound(&self, cx: &mut Context<Self>) {
+        let enabled = self.sound_enabled;
+        let volume = self.sound_volume;
+        let sent = cx.try_global::<SessionCommands>().is_some_and(|commands| {
+            commands
+                .0
+                .send(SessionCommand::SetSound { enabled, volume })
+                .is_ok()
+        });
+        if sent {
+            return;
+        }
         let mut state = LocalState::load();
-        state.sound_enabled = self.sound_enabled;
+        state.sound_enabled = enabled;
+        state.sound_volume = volume;
         if let Err(err) = state.save() {
             tracing::warn!("could not store sound setting: {err}");
         }
+    }
+
+    fn apply_volume_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(bounds) = self.volume_bounds else {
+            return;
+        };
+        let volume = volume_from_bounds(bounds, position);
+        if volume == self.sound_volume {
+            return;
+        }
+        self.sound_volume = volume;
+        self.persist_sound(cx);
+        cx.notify();
+    }
+
+    fn reload_messages(&mut self) {
+        self.messages = openover_core::load_message_log();
+    }
+
+    fn clear_messages(&mut self, cx: &mut Context<Self>) {
+        openover_core::clear_message_log();
+        self.messages.clear();
+        self.selected_id = None;
         cx.notify();
     }
 
@@ -216,7 +269,8 @@ impl Settings {
                 if !self.accept_epoch(epoch) {
                     return false;
                 }
-                show_toast(cx, &toast, self.sound_enabled);
+                show_toast(cx, &toast, self.sound_enabled, self.sound_volume);
+                self.reload_messages();
                 if let Some(receipt) = toast.receipt.clone() {
                     self.pending_emergency = Some((receipt, toast.title.clone()));
                 }
@@ -261,6 +315,12 @@ impl Settings {
                 open_settings = true;
             }
             SessionEvent::Activate => open_settings = true,
+            SessionEvent::OpenMessage { id } => {
+                self.reload_messages();
+                self.pane = Pane::Messages;
+                self.selected_id = Some(id);
+                open_settings = true;
+            }
         }
         cx.notify();
         open_settings
@@ -288,7 +348,6 @@ impl Render for Settings {
             Ok(()) => format!("{}/25", device_name.chars().count()),
             Err(err) => err.to_string(),
         };
-        let account_tab = self.pane == Pane::Account;
         let logged_in = self.logged_in;
         let button_label = if self.busy {
             "Anmeldung läuft…"
@@ -337,23 +396,40 @@ impl Render for Settings {
                     .flex()
                     .gap(px(16.))
                     .child(
-                        tab_button("tab-account", "Konto", account_tab, &theme).on_click(
-                            cx.listener(|this, _, _, cx| {
+                        tab_button("tab-account", "Konto", self.pane == Pane::Account, &theme)
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 this.pane = Pane::Account;
                                 cx.notify();
-                            }),
-                        ),
+                            })),
                     )
                     .child(
-                        tab_button("tab-preferences", "Einstellungen", !account_tab, &theme)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.pane = Pane::Preferences;
-                                cx.notify();
-                            })),
+                        tab_button(
+                            "tab-preferences",
+                            "Einstellungen",
+                            self.pane == Pane::Preferences,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.pane = Pane::Preferences;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        tab_button(
+                            "tab-messages",
+                            "Nachrichten",
+                            self.pane == Pane::Messages,
+                            &theme,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.reload_messages();
+                            this.pane = Pane::Messages;
+                            cx.notify();
+                        })),
                     ),
             )
-            .child(if account_tab {
-                account_pane(
+            .child(match self.pane {
+                Pane::Account => account_pane(
                     self,
                     &theme,
                     &email,
@@ -363,9 +439,9 @@ impl Render for Settings {
                     device_focused,
                     button_label,
                     cx,
-                )
-            } else {
-                preferences_pane(self, &theme, &device_name, cx)
+                ),
+                Pane::Preferences => preferences_pane(self, &theme, &device_name, cx),
+                Pane::Messages => messages_pane(self, &theme, cx),
             })
             .when_some(self.pending_emergency.clone(), |form, (_, title)| {
                 form.child(emergency_card(title, &theme, cx))
@@ -505,6 +581,12 @@ fn preferences_pane(
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_sound(cx))),
         ))
+        .child(labeled("Lautstärke", volume_slider(settings, theme, cx)))
+        .child(
+            div()
+                .text_color(theme.quiet)
+                .child("0 ist stumm, auch wenn der Ton an ist."),
+        )
         .child(labeled(
             "Gerätename",
             field_chrome(div(), theme, false).child(shown_name),
@@ -514,6 +596,249 @@ fn preferences_pane(
                 .text_color(theme.quiet)
                 .child("Der Gerätename wird beim Anmelden festgelegt."),
         )
+}
+
+fn volume_slider(
+    settings: &Settings,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> gpui::Stateful<gpui::Div> {
+    let fraction = f32::from(settings.sound_volume) / 100.0;
+    let view = cx.entity().downgrade();
+    field_chrome(div().id("sound-volume"), theme, settings.dragging_volume)
+        .cursor_pointer()
+        .gap(px(12.))
+        .child(
+            div()
+                .flex_1()
+                .h(px(4.))
+                .rounded_md()
+                .bg(theme.border)
+                .child(
+                    div()
+                        .h(px(4.))
+                        .w(relative(fraction))
+                        .rounded_md()
+                        .bg(theme.accent),
+                ),
+        )
+        .child(
+            div()
+                .w(px(28.))
+                .text_color(if settings.sound_volume == 0 {
+                    theme.quiet
+                } else {
+                    theme.accent
+                })
+                .child(settings.sound_volume.to_string()),
+        )
+        .on_mouse_down_all({
+            let view = view.clone();
+            move |event, phase, hitbox: &Hitbox, window, cx| {
+                if phase != DispatchPhase::Bubble
+                    || event.button != MouseButton::Left
+                    || !hitbox.is_hovered(window)
+                {
+                    return;
+                }
+                window.capture_pointer(hitbox.id);
+                let Some(view) = view.upgrade() else {
+                    return;
+                };
+                let bounds = hitbox.bounds;
+                let position = event.position;
+                view.update(cx, |this, cx| {
+                    this.volume_bounds = Some(bounds);
+                    this.dragging_volume = true;
+                    this.apply_volume_at(position, cx);
+                    cx.notify();
+                });
+            }
+        })
+        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+            if this.dragging_volume {
+                this.apply_volume_at(event.position, cx);
+            }
+        }))
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(|this, _, _, cx| {
+                if this.dragging_volume {
+                    this.dragging_volume = false;
+                    cx.notify();
+                }
+            }),
+        )
+}
+
+fn messages_pane(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settings>) -> gpui::Div {
+    let selected = settings.selected_id.and_then(|id| {
+        settings
+            .messages
+            .iter()
+            .find(|message| message.id == id)
+            .cloned()
+    });
+    let mut pane = div()
+        .flex()
+        .flex_col()
+        .gap(px(16.))
+        .child(message_bar(theme, cx));
+    if settings.messages.is_empty() {
+        return pane.child(
+            div()
+                .text_color(theme.quiet)
+                .child("Noch keine Nachrichten."),
+        );
+    }
+    pane = pane.child(message_detail(
+        selected.as_ref(),
+        settings.selected_id.is_some(),
+        theme,
+        cx,
+    ));
+    let mut list = div()
+        .id("message-list")
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .max_h(px(280.))
+        .overflow_y_scroll();
+    for message in &settings.messages {
+        list = list.child(message_row(
+            message,
+            settings.selected_id == Some(message.id),
+            theme,
+            cx,
+        ));
+    }
+    pane.child(list)
+}
+
+fn message_bar(theme: &FormTheme, cx: &mut Context<Settings>) -> impl IntoElement {
+    field_chrome(div(), theme, false)
+        .justify_between()
+        .child(div().text_color(theme.quiet).child("Neueste zuerst"))
+        .child(
+            div()
+                .id("clear-messages")
+                .cursor_pointer()
+                .text_color(theme.accent)
+                .child("Leeren")
+                .on_click(cx.listener(|this, _, _, cx| this.clear_messages(cx))),
+        )
+}
+
+fn message_detail(
+    message: Option<&LoggedMessage>,
+    missing: bool,
+    theme: &FormTheme,
+    _cx: &mut Context<Settings>,
+) -> gpui::Div {
+    let Some(message) = message else {
+        let hint = if missing {
+            "Diese Nachricht ist nicht mehr gespeichert."
+        } else {
+            "Eine Nachricht auswählen, um den Text zu lesen."
+        };
+        return div().text_color(theme.quiet).child(hint);
+    };
+    let url = message.url.clone();
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .w_full()
+        .min_h(field_height())
+        .px_3()
+        .py_2()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.field)
+        .child(
+            div()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .whitespace_normal()
+                .child(message.title.clone()),
+        )
+        .child(
+            div()
+                .text_color(theme.quiet)
+                .whitespace_normal()
+                .child(message_meta(message)),
+        )
+        .child(div().whitespace_normal().child(message_body(message)))
+        .when_some(url, |detail, url| {
+            detail.child(
+                div()
+                    .id("message-url")
+                    .cursor_pointer()
+                    .underline()
+                    .text_color(theme.quiet)
+                    .overflow_hidden()
+                    .child(url.clone())
+                    .on_click(move |_, _, cx| {
+                        cx.open_url(&url);
+                    }),
+            )
+        })
+}
+
+fn message_row(
+    message: &LoggedMessage,
+    selected: bool,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> gpui::Stateful<gpui::Div> {
+    let id = message.id;
+    field_chrome(
+        div().id(SharedString::from(format!("msg-{id}"))),
+        theme,
+        selected,
+    )
+    .cursor_pointer()
+    .justify_between()
+    .gap(px(8.))
+    .on_click(cx.listener(move |this, _, _, cx| {
+        this.selected_id = Some(id);
+        cx.notify();
+    }))
+    .child(
+        div()
+            .flex_1()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(message.title.clone()),
+    )
+    .child(
+        div()
+            .text_color(theme.quiet)
+            .whitespace_nowrap()
+            .child(format_local_time(message.time)),
+    )
+}
+
+fn message_meta(message: &LoggedMessage) -> String {
+    let mut meta = format!(
+        "{} · {} · Priorität {}",
+        format_local_time(message.time),
+        message.app,
+        message.priority
+    );
+    if let Some(sound) = message.sound.as_deref() {
+        meta.push_str(" · ");
+        meta.push_str(sound);
+    }
+    meta
+}
+
+fn message_body(message: &LoggedMessage) -> String {
+    if message.text.is_empty() {
+        "Kein Text.".into()
+    } else {
+        message.text.clone()
+    }
 }
 
 fn emergency_card(
@@ -634,7 +959,7 @@ fn text_field(
     )
 }
 
-fn show_toast(cx: &mut App, toast: &Toast, sound_enabled: bool) {
+fn show_toast(cx: &mut App, toast: &Toast, sound_enabled: bool, sound_volume: u8) {
     let mut actions = Vec::new();
     if let Some(receipt) = &toast.receipt {
         actions.push(SystemNotificationAction {
@@ -642,8 +967,11 @@ fn show_toast(cx: &mut App, toast: &Toast, sound_enabled: bool) {
             label: "Bestätigen".into(),
         });
     }
-    if sound_enabled && let Some(path) = &toast.sound_path {
-        crate::sound::play(path.clone());
+    if sound_enabled
+        && sound_volume > 0
+        && let Some(path) = &toast.sound_path
+    {
+        crate::sound::play(path.clone(), sound_volume);
     }
     crate::notify::present(
         cx,
@@ -653,6 +981,7 @@ fn show_toast(cx: &mut App, toast: &Toast, sound_enabled: bool) {
             body: toast.body.clone().into(),
             actions,
         },
+        Some(toast.message_id.to_string()),
     );
 }
 
@@ -665,7 +994,7 @@ fn show_backlog_toast(cx: &mut App, count: usize) {
         )
         .into(),
         actions: vec![],
-    });
+    }, None);
 }
 
 fn send_acknowledge(cx: &mut App, receipt: &str) {
@@ -785,4 +1114,83 @@ pub fn open_settings_window(cx: &mut App) {
         }
         Err(err) => tracing::error!("settings window failed: {err}"),
     }
+}
+
+fn volume_from_bounds(bounds: Bounds<Pixels>, position: Point<Pixels>) -> u8 {
+    let width = bounds.size.width.as_f32();
+    if width <= 1.0 {
+        return 0;
+    }
+    let x = (position.x - bounds.origin.x).as_f32();
+    let ratio = (x / width).clamp(0.0, 1.0);
+    (ratio * 100.0).round().clamp(0.0, 100.0) as u8
+}
+
+fn format_local_time(unix: u64) -> String {
+    #[cfg(windows)]
+    if let Some(formatted) = windows_local_time(unix) {
+        return formatted;
+    }
+    unix.to_string()
+}
+
+#[cfg(windows)]
+fn windows_local_time(unix: u64) -> Option<String> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn FileTimeToSystemTime(file: *const FileTime, system: *mut SystemTime) -> i32;
+        fn SystemTimeToTzSpecificLocalTime(
+            zone: *const core::ffi::c_void,
+            utc: *const SystemTime,
+            local: *mut SystemTime,
+        ) -> i32;
+    }
+    let ticks = unix
+        .saturating_add(11_644_473_600)
+        .saturating_mul(10_000_000);
+    let file = FileTime {
+        low: ticks as u32,
+        high: (ticks >> 32) as u32,
+    };
+    let mut utc = SystemTime {
+        year: 0,
+        month: 0,
+        day_of_week: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        milliseconds: 0,
+    };
+    let mut local = utc;
+    unsafe {
+        if FileTimeToSystemTime(&file, &mut utc) == 0 {
+            return None;
+        }
+        if SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) == 0 {
+            return None;
+        }
+    }
+    Some(format!(
+        "{:02}.{:02}.{:04} {:02}:{:02}",
+        local.day, local.month, local.year, local.hour, local.minute
+    ))
 }
