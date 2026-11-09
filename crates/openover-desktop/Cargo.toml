@@ -1,0 +1,20 @@
+[package]
+name = "openover-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tray-first unofficial Pushover Open Client desktop app (GPUI)"
+
+[[bin]]
+name = "openover-desktop"
+path = "src/main.rs"
+
+[dependencies]
+openover-core = { path = "../openover-core" }
+tokio = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+gpui_ce_backend = { package = "gpui-ce", version = "0.3" }
+gpui_platform = { package = "gpui_ce_platform", version = "0.3" }
+gpui-tray = { version = "0.3", default-features = false, features = ["gpui-ce", "menu-state"] }
