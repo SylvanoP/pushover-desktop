@@ -1359,12 +1359,22 @@ pub fn install(cx: &mut App, background: bool) {
 }
 
 pub fn open_settings_window(cx: &mut App) {
+    open_settings_window_with_token(None, cx);
+}
+
+pub fn open_preferences(cx: &mut App) {
+    let view = settings_entity(cx);
+    view.update(cx, |settings, cx| {
+        settings.pane = Pane::Preferences;
+        cx.notify();
+    });
+    open_settings_window(cx);
+}
+
+pub fn open_settings_window_with_token(token: Option<&str>, cx: &mut App) {
     if let Some(SettingsWindow(existing)) = cx.try_global::<SettingsWindow>().copied()
         && existing
-            .update(cx, |_settings, window, _cx| {
-                window.set_visible(true);
-                window.activate();
-            })
+            .update(cx, |_settings, window, _cx| reveal(window, token))
             .is_ok()
     {
         cx.activate(true);
@@ -1380,7 +1390,8 @@ pub fn open_settings_window(cx: &mut App) {
             .titlebar(Some(TitlebarOptions {
                 title: Some(window_title(view.read(cx).logged_in).into()),
                 ..Default::default()
-            })),
+            }))
+            .icon(Some(crate::icon::window_image())),
         move |window, cx| {
             window.on_window_should_close(cx, |window, _cx| {
                 window.set_visible(false);
@@ -1398,6 +1409,14 @@ pub fn open_settings_window(cx: &mut App) {
         }
         Err(err) => tracing::error!("settings window failed: {err}"),
     }
+}
+
+fn reveal(window: &mut Window, token: Option<&str>) {
+    window.set_visible(true);
+    if token.is_some_and(|token| window.activate_with_token(token)) {
+        return;
+    }
+    window.activate();
 }
 
 const fn allow_window_close() -> bool {

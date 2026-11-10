@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod form_theme;
+mod icon;
 mod instance;
 mod notify;
 mod password_field;
