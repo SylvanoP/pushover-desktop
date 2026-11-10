@@ -417,11 +417,6 @@ async fn run_push(push: PushRun) {
                         state: Connection::SyncFailed,
                     },
                 );
-            } else if report.discarded == 0 {
-                send(
-                    &events,
-                    SessionEvent::Status("Warte auf die Push-Verbindung.".into()),
-                );
             }
         }
         Err(err) => {
@@ -472,15 +467,6 @@ async fn run_push(push: PushRun) {
                             Connection::SyncFailed
                         };
                         send(&events, SessionEvent::Connection { epoch, state });
-                        if fetch_ok {
-                            send(
-                                &events,
-                                SessionEvent::Status(
-                                    "Verbunden. Neue Nachrichten erscheinen als Benachrichtigung."
-                                        .into(),
-                                ),
-                            );
-                        }
                     }
                     Some(PushLoopEvent::Disconnected) => {
                         send(
