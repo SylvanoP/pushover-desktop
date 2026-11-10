@@ -6,7 +6,11 @@ pub const API_BASE: &str = "https://api.pushover.net/1";
 pub const PUSHOVER_WS_URL: &str = "wss://client.pushover.net/push";
 /// Origin on the WebSocket handshake. Known Open Client clients send a browser-style origin.
 pub const PUSHOVER_WS_ORIGIN: &str = "http://localhost/";
-pub const USER_AGENT: &str = "openover-desktop/0.1.0 (Rust; Open Client)";
+pub const USER_AGENT: &str = concat!(
+    "openover-desktop/",
+    env!("CARGO_PKG_VERSION"),
+    " (Rust; Open Client)"
+);
 
 /// Open Client device OS code (`O`).
 #[derive(Debug, Clone, Copy, Serialize)]

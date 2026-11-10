@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 openover-core = { path = "../openover-core" }
 tokio = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

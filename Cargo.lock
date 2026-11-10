@@ -4480,7 +4480,7 @@ dependencies = [
 
 [[package]]
 name = "openover-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "futures-util",
  "keyring",
@@ -4496,7 +4496,7 @@ dependencies = [
 
 [[package]]
 name = "openover-desktop"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "clap",
  "futures-channel",
@@ -4506,6 +4506,8 @@ dependencies = [
  "gpui_ce_elements",
  "gpui_ce_platform",
  "openover-core",
+ "reqwest",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -37,6 +37,9 @@ pub struct LocalState {
     /// Playback level from 0 to 100. Missing keys stay at full volume.
     #[serde(default = "sound_volume_by_default")]
     pub sound_volume: u8,
+    /// Wish for the Windows Run key. A missing key stays off.
+    #[serde(default)]
+    pub start_with_windows: bool,
 }
 
 fn sound_enabled_by_default() -> bool {
@@ -61,6 +64,7 @@ impl Default for LocalState {
             emergencies: Vec::new(),
             sound_enabled: true,
             sound_volume: 100,
+            start_with_windows: false,
         }
     }
 }
@@ -173,6 +177,7 @@ mod tests {
             }],
             sound_enabled: true,
             sound_volume: 40,
+            start_with_windows: true,
         };
         state.write(&path).unwrap();
         let loaded = LocalState::read(&path).unwrap();
@@ -185,6 +190,7 @@ mod tests {
         let state: LocalState = serde_json::from_str("{}").unwrap();
         assert!(state.sound_enabled);
         assert_eq!(state.sound_volume, 100);
+        assert!(!state.start_with_windows);
         assert_eq!(super::clamp_volume(140), 100);
         assert_eq!(super::clamp_volume(0), 0);
     }

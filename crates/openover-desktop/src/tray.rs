@@ -18,6 +18,7 @@ pub fn setup(cx: &mut App) -> gpui_tray::Result<()> {
         .icon(tray_icon()?)
         .title("Openover")
         .tooltip("Openover — unofficial Pushover Open Client")
+        .on_activate_with(|_token, cx| settings::open_settings_window(cx))
         .menu(build_menu)
         .build(cx)?;
     cx.set_global(AppTray(tray));
@@ -26,7 +27,7 @@ pub fn setup(cx: &mut App) -> gpui_tray::Result<()> {
 
 fn build_menu(_cx: &mut App) -> Vec<MenuItem> {
     vec![
-        MenuItem::action("Einstellungen…", OpenSettings),
+        MenuItem::action("Öffnen", OpenSettings),
         MenuItem::action("Abmelden", Logout),
         MenuItem::separator(),
         MenuItem::action("Beenden", Quit),
@@ -59,8 +60,13 @@ pub fn set_tooltip_text(cx: &mut App, text: &str) {
 }
 
 fn quit(_: &Quit, cx: &mut App) {
-    let tray = cx.global::<AppTray>().0.clone();
-    let _ = tray.close(cx);
+    exit(cx);
+}
+
+pub fn exit(cx: &mut App) {
+    if let Some(tray) = cx.try_global::<AppTray>().map(|tray| tray.0.clone()) {
+        let _ = tray.close(cx);
+    }
     cx.quit();
 }
 

@@ -3,10 +3,10 @@ resolver = "3"
 members = ["crates/openover-core", "crates/openover-desktop"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/tobiasgemini/openover-desktop"
+repository = "https://github.com/SylvanoP/pushover-desktop"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

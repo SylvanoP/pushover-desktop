@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn user_agent_matches_policy() {
-        assert_eq!(USER_AGENT, "openover-desktop/0.1.0 (Rust; Open Client)");
+        assert_eq!(USER_AGENT, "openover-desktop/0.1.2 (Rust; Open Client)");
         assert!(USER_AGENT.contains("openover-desktop"));
         assert!(USER_AGENT.contains("Open Client"));
     }

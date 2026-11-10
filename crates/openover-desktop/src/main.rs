@@ -7,7 +7,9 @@ mod password_field;
 mod session;
 mod settings;
 mod sound;
+mod startup;
 mod tray;
+mod update;
 
 extern crate gpui_ce_backend as gpui;
 
@@ -31,6 +33,9 @@ struct Cli {
     /// Download and play one Pushover sound, for example `bike`.
     #[arg(long, value_name = "CODE")]
     play_sound: Option<String>,
+    /// Start in the tray. A saved session stays hidden until the tray opens it.
+    #[arg(long)]
+    background: bool,
 }
 
 fn main() {
@@ -50,6 +55,8 @@ fn main() {
         instance::signal_running_instance();
         return;
     }
+    #[cfg(windows)]
+    discard_replaced_exe();
 
     application()
         .with_quit_mode(QuitMode::Explicit)
@@ -62,7 +69,7 @@ fn main() {
                 return;
             }
 
-            settings::install(cx);
+            settings::install(cx, cli.background);
 
             if cli.demo_toast {
                 show_demo_notification(cx);
@@ -71,6 +78,14 @@ fn main() {
                 play_sound_code(&code, false);
             }
         });
+}
+
+#[cfg(windows)]
+fn discard_replaced_exe() {
+    let Ok(current) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::fs::remove_file(current.with_extension("exe.old"));
 }
 
 fn play_sound_code(code: &str, wait: bool) {
@@ -120,7 +135,7 @@ fn show_demo_notification(cx: &mut App) {
         SystemNotification {
             tag: DEMO_NOTIFICATION_TAG.into(),
             title: "Openover (Demo)".into(),
-            body: "Inoffizieller Pushover Open Client — Scaffold v0.1.0".into(),
+            body: "Inoffizieller Pushover Open Client".into(),
             actions: vec![],
         },
         None,

@@ -38,6 +38,18 @@ enum Pane {
     Messages,
 }
 
+enum UpdateLine {
+    Idle,
+    Checking,
+    Current,
+    #[cfg(windows)]
+    Ready {
+        version: String,
+        path: std::path::PathBuf,
+    },
+    Failed(String),
+}
+
 pub struct Settings {
     email: Entity<EditableTextState>,
     password: Entity<MaskedPassword>,
@@ -58,6 +70,12 @@ pub struct Settings {
     epoch: u64,
     status: SharedString,
     pending_emergency: Option<(String, String)>,
+    #[cfg(windows)]
+    start_with_windows: bool,
+    #[cfg(windows)]
+    autostart_note: SharedString,
+    update_busy: bool,
+    update_line: UpdateLine,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -100,6 +118,12 @@ impl Settings {
             epoch: 0,
             status: SharedString::default(),
             pending_emergency: None,
+            #[cfg(windows)]
+            start_with_windows: remembered_autostart(),
+            #[cfg(windows)]
+            autostart_note: SharedString::default(),
+            update_busy: false,
+            update_line: UpdateLine::Idle,
             _subscriptions: subscriptions,
         }
     }
@@ -347,6 +371,91 @@ impl Settings {
         self.status = status.into();
         cx.notify();
     }
+
+    fn start_update_check(&mut self, cx: &mut Context<Self>) {
+        if self.update_busy {
+            return;
+        }
+        self.update_busy = true;
+        self.update_line = UpdateLine::Checking;
+        cx.notify();
+        let (tx, rx) = futures_channel::oneshot::channel();
+        if std::thread::Builder::new()
+            .name("openover-update".into())
+            .spawn(move || {
+                let _ = tx.send(crate::update::check_now());
+            })
+            .is_err()
+        {
+            self.update_busy = false;
+            self.update_line = UpdateLine::Failed("Prüfung konnte nicht starten.".into());
+            cx.notify();
+            return;
+        }
+        cx.spawn(async move |_this, cx| {
+            let outcome = match rx.await {
+                Ok(outcome) => outcome,
+                Err(_) => crate::update::CheckOutcome::Failed("Prüfung abgebrochen.".into()),
+            };
+            cx.update(|cx| {
+                settings_entity(cx).update(cx, |this, cx| this.finish_update_check(outcome, cx));
+            });
+        })
+        .detach();
+    }
+
+    fn finish_update_check(
+        &mut self,
+        outcome: crate::update::CheckOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_busy = false;
+        self.update_line = match outcome {
+            crate::update::CheckOutcome::Current => UpdateLine::Current,
+            #[cfg(windows)]
+            crate::update::CheckOutcome::Ready { version, path } => {
+                UpdateLine::Ready { version, path }
+            }
+            crate::update::CheckOutcome::Failed(message) => {
+                tracing::warn!("update check: {message}");
+                UpdateLine::Failed(message)
+            }
+        };
+        cx.notify();
+    }
+
+    #[cfg(windows)]
+    fn restart_for_update(&mut self, cx: &mut Context<Self>) {
+        let UpdateLine::Ready { path, .. } = &self.update_line else {
+            return;
+        };
+        let path = path.clone();
+        match crate::update::stage_restart(&path) {
+            Ok(()) => crate::tray::exit(cx),
+            Err(message) => {
+                self.update_line = UpdateLine::Failed(message);
+                cx.notify();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn toggle_autostart(&mut self, cx: &mut Context<Self>) {
+        let next = !self.start_with_windows;
+        if let Err(err) = crate::startup::write_enabled(next) {
+            self.autostart_note = format!("Autostart: {err}").into();
+            cx.notify();
+            return;
+        }
+        self.start_with_windows = next;
+        self.autostart_note = SharedString::default();
+        let mut state = LocalState::load();
+        state.start_with_windows = next;
+        if let Err(err) = state.save() {
+            tracing::warn!("could not store autostart wish: {err}");
+        }
+        cx.notify();
+    }
 }
 
 impl Render for Settings {
@@ -528,7 +637,7 @@ fn preferences_pane(
         device_name.to_string()
     };
     let sound_label = if settings.sound_enabled { "An" } else { "Aus" };
-    div()
+    let pane = div()
         .flex()
         .flex_col()
         .gap(px(16.))
@@ -560,7 +669,138 @@ fn preferences_pane(
         .child(labeled(
             "Gerätename",
             field_chrome(div(), theme, false).child(shown_name),
-        ))
+        ));
+    #[cfg(windows)]
+    let pane = pane.child(autostart_row(settings, theme, cx));
+    pane.child(update_row(settings, theme, cx))
+}
+
+fn update_row(
+    settings: &Settings,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> impl IntoElement {
+    let detail = match &settings.update_line {
+        UpdateLine::Idle => String::new(),
+        UpdateLine::Checking => "Prüfe…".to_string(),
+        UpdateLine::Current => "Aktuell".to_string(),
+        #[cfg(windows)]
+        UpdateLine::Ready { version, .. } => format!("Version {version} bereit"),
+        UpdateLine::Failed(message) => message.clone(),
+    };
+    let failed = matches!(settings.update_line, UpdateLine::Failed(_));
+    let busy = settings.update_busy;
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .child(SharedString::from(format!(
+                    "Version {}",
+                    env!("CARGO_PKG_VERSION")
+                )))
+                .child(
+                    div()
+                        .text_color(if failed { theme.stopped } else { theme.quiet })
+                        .child(SharedString::from(detail)),
+                ),
+        )
+        .child(update_actions(settings, theme, busy, cx))
+}
+
+fn update_actions(
+    settings: &Settings,
+    theme: &FormTheme,
+    busy: bool,
+    cx: &mut Context<Settings>,
+) -> gpui::Div {
+    let row = div().flex().items_center().gap(px(16.)).child(
+        div()
+            .id("search-updates")
+            .cursor_pointer()
+            .text_color(if busy { theme.quiet } else { theme.accent })
+            .child("Nach Updates suchen")
+            .on_click(cx.listener(|this, _, _, cx| this.start_update_check(cx))),
+    );
+    append_restart(row, settings, theme, cx)
+}
+
+fn append_restart(
+    row: gpui::Div,
+    settings: &Settings,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> gpui::Div {
+    #[cfg(windows)]
+    {
+        row.when(
+            matches!(settings.update_line, UpdateLine::Ready { .. }),
+            |row| {
+                row.child(
+                    div()
+                        .id("install-update")
+                        .cursor_pointer()
+                        .text_color(theme.accent)
+                        .child("Neu starten und aktualisieren")
+                        .on_click(cx.listener(|this, _, _, cx| this.restart_for_update(cx))),
+                )
+            },
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (settings, theme, cx);
+        row
+    }
+}
+
+#[cfg(windows)]
+fn autostart_row(
+    settings: &Settings,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> impl IntoElement {
+    let label = if settings.start_with_windows {
+        "An"
+    } else {
+        "Aus"
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .child(
+            field_chrome(
+                div().id("autostart-toggle"),
+                theme,
+                settings.start_with_windows,
+            )
+            .cursor_pointer()
+            .justify_between()
+            .child("Mit Windows starten")
+            .child(
+                div()
+                    .text_color(if settings.start_with_windows {
+                        theme.accent
+                    } else {
+                        theme.quiet
+                    })
+                    .child(label),
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_autostart(cx))),
+        )
+        .when(!settings.autostart_note.is_empty(), |row| {
+            row.child(
+                div()
+                    .text_color(theme.stopped)
+                    .child(settings.autostart_note.clone()),
+            )
+        })
 }
 
 fn volume_slider(
@@ -1062,7 +1302,7 @@ fn settings_entity(cx: &mut App) -> Entity<Settings> {
     entity
 }
 
-pub fn install(cx: &mut App) {
+pub fn install(cx: &mut App, background: bool) {
     cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
 
     let initial = CredentialStore::load().ok();
@@ -1082,6 +1322,9 @@ pub fn install(cx: &mut App) {
         crate::tray::set_tooltip_text(cx, Connection::Connecting.tooltip());
     } else {
         crate::tray::set_tooltip_text(cx, Connection::SignedOut.tooltip());
+    }
+    settings.update(cx, |this, cx| this.start_update_check(cx));
+    if !background || !has_session {
         open_settings_window(cx);
     }
 
@@ -1118,7 +1361,10 @@ pub fn install(cx: &mut App) {
 pub fn open_settings_window(cx: &mut App) {
     if let Some(SettingsWindow(existing)) = cx.try_global::<SettingsWindow>().copied()
         && existing
-            .update(cx, |_settings, window, _cx| window.activate())
+            .update(cx, |_settings, window, _cx| {
+                window.set_visible(true);
+                window.activate();
+            })
             .is_ok()
     {
         cx.activate(true);
@@ -1136,6 +1382,10 @@ pub fn open_settings_window(cx: &mut App) {
                 ..Default::default()
             })),
         move |window, cx| {
+            window.on_window_should_close(cx, |window, _cx| {
+                window.set_visible(false);
+                allow_window_close()
+            });
             if !view.read(cx).logged_in {
                 email.focus_handle(cx).focus(window, cx);
             }
@@ -1148,6 +1398,26 @@ pub fn open_settings_window(cx: &mut App) {
         }
         Err(err) => tracing::error!("settings window failed: {err}"),
     }
+}
+
+const fn allow_window_close() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn remembered_autostart() -> bool {
+    let enabled = crate::startup::read_enabled();
+    if enabled && let Err(err) = crate::startup::write_enabled(true) {
+        tracing::warn!("could not refresh autostart command: {err}");
+    }
+    let mut state = LocalState::load();
+    if state.start_with_windows != enabled {
+        state.start_with_windows = enabled;
+        if let Err(err) = state.save() {
+            tracing::warn!("could not store autostart wish: {err}");
+        }
+    }
+    enabled
 }
 
 fn volume_from_bounds(bounds: Bounds<Pixels>, position: Point<Pixels>) -> u8 {
@@ -1227,4 +1497,12 @@ fn windows_local_time(unix: u64) -> Option<String> {
         "{:02}.{:02}.{:04} {:02}:{:02}",
         local.day, local.month, local.year, local.hour, local.minute
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn closing_the_window_does_not_quit() {
+        assert!(!super::allow_window_close());
+    }
 }
