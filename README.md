@@ -1,14 +1,16 @@
 # Openover Desktop
 
-**Deutsch (primär)** — Inoffizieller **Pushover Open Client** für Windows, macOS und Linux. Tray-first: die App startet im System-Tray; das Fenster ist die Anmeldung und die Einstellungen.
+**Deutsch (primär)** — Inoffizieller **Pushover Open Client**. Die veröffentlichte Datei gibt es nur für Windows. Tray-first: die App startet im System-Tray; das Fenster ist die Anmeldung und die Einstellungen.
 
 > **Disclaimer:** Dieses Projekt ist **nicht** von Pushover LLC veröffentlicht oder unterstützt. Pushover® ist eine Marke von Pushover LLC. Bitte beachtet die [Pushover Distribution Guidelines](https://pushover.net/api/client/#distribution-guidelines) (kein „Pushover for …“ im Namen, kein Pushover-Logo als App-Icon).
 
-**Lizenz für den Dienst:** Für Open-Client-Geräte ist eine [Pushover for Desktop](https://pushover.net/clients/desktop)-Lizenz erforderlich (30-Tage-Test, danach einmalig ~5 USD). Kauf und Account nur über [pushover.net](https://pushover.net/).
+**Lizenz für den Dienst:** Für Open-Client-Geräte ist eine [Pushover-Desktop-Lizenz](https://pushover.net/clients/desktop) erforderlich (30-Tage-Test, danach einmalig ~5 USD). Kauf und Account nur über [pushover.net](https://pushover.net/).
 
-**English (short):** Unofficial Pushover **Open Client** desktop app (`os=O`). Not affiliated with Pushover LLC. Desktop license required per Pushover policy. MIT-licensed source; build from source today; GitHub Releases planned later.
+**Download (nur Windows x64):** [openover-desktop-windows-x64.exe](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.2/openover-desktop-windows-x64.exe) aus dem Release [v0.1.2](https://github.com/SylvanoP/pushover-desktop/releases/tag/v0.1.2).
 
-## Status (v0.1.0)
+**English (short):** Unofficial Pushover **Open Client** (`os=O`). Not affiliated with Pushover LLC. The app does not use the Pushover logo and is not named “Pushover for …”. The only published file is the Windows x64 build [openover-desktop-windows-x64.exe](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.2/openover-desktop-windows-x64.exe) on the [v0.1.2 release](https://github.com/SylvanoP/pushover-desktop/releases/tag/v0.1.2). A Pushover desktop license is required. The source is MIT-licensed.
+
+## Status
 
 - GPUI (`gpui-ce`) + `gpui-tray`
 - Anmeldung im Einstellungsfenster (E-Mail, Passwort, optional 2FA, Gerätename)
