@@ -5,6 +5,8 @@ mod icon;
 mod instance;
 mod notify;
 mod password_field;
+#[cfg(windows)]
+mod power;
 mod session;
 mod settings;
 mod sound;

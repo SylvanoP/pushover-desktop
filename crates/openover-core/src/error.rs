@@ -46,8 +46,17 @@ pub enum CredentialError {
 pub enum WebSocketError {
     #[error("connection failed: {0}")]
     Connect(Box<tokio_tungstenite::tungstenite::Error>),
+    #[error("push socket dropped: {0}")]
+    Dropped(Box<tokio_tungstenite::tungstenite::Error>),
     #[error("fatal push frame: {0}")]
     FatalFrame(char),
     #[error("channel closed")]
     Closed,
+    /// The read produced nothing until the idle limit. Sleep often leaves the
+    /// TCP socket open with no close frame, so `next()` would wait forever.
+    #[error("push socket stalled")]
+    Stalled,
+    /// Windows reported resume from sleep, or the resume watch fired.
+    #[error("system resumed from sleep")]
+    Resume,
 }

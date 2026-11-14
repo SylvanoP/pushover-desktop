@@ -26,7 +26,7 @@ gpui_ce_elements = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Foundation", "UI_Notifications", "Data_Xml_Dom", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Foundation", "UI_Notifications", "Data_Xml_Dom", "Win32_UI_WindowsAndMessaging", "Win32_System_Power"] }
 windows-registry = "0.100"
 
 [target.'cfg(windows)'.build-dependencies]

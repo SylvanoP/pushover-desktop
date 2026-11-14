@@ -237,6 +237,14 @@ fn strip_tags(input: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// Toasts whose ids are already stored locally. A later fetch must not show them again.
+pub fn without_known_ids(toasts: Vec<Toast>, known: &[u64]) -> Vec<Toast> {
+    toasts
+        .into_iter()
+        .filter(|toast| !known.contains(&toast.message_id))
+        .collect()
+}
+
 fn truncate_chars(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
@@ -266,6 +274,32 @@ mod tests {
             receipt: None,
             date: None,
         }
+    }
+
+    fn toast(id: u64, sound: Option<&str>) -> Toast {
+        Toast {
+            message_id: id,
+            title: format!("T{id}"),
+            body: format!("body {id}"),
+            app: "Demo".into(),
+            priority: 0,
+            receipt: None,
+            sound: sound.map(str::to_string),
+            sound_path: None,
+        }
+    }
+
+    #[test]
+    fn logged_ids_are_not_toasted_again() {
+        let mut already = toast(7, Some("pushover"));
+        already.priority = 2;
+        already.receipt = Some("receipt".into());
+        let fresh = toast(8, Some("bike"));
+        let left = without_known_ids(vec![already, fresh], &[7]);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].message_id, 8);
+        assert_eq!(left[0].sound.as_deref(), Some("bike"));
+        assert_eq!(left[0].priority, 0);
     }
 
     #[test]

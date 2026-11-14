@@ -6,7 +6,8 @@ use futures_channel::mpsc::UnboundedSender;
 use openover_core::{
     ApiError, CredentialStore, LocalState, PendingEmergency, PushLoop, PushLoopEvent,
     PushoverClient, StoredCredentials, Toast, append_message_log, clamp_volume,
-    cursor_after_delete, entries_for_toasts, plan_sync, wipe_secret,
+    cursor_after_delete, entries_for_toasts, load_message_log, plan_sync, wipe_secret,
+    without_known_ids,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -134,6 +135,7 @@ struct Live {
     state: Arc<Mutex<LocalState>>,
     generation: Arc<AtomicU64>,
     stop: Option<watch::Sender<bool>>,
+    resume_tx: watch::Sender<u64>,
     events: UnboundedSender<SessionEvent>,
 }
 
@@ -151,12 +153,16 @@ async fn session_main(
             return;
         }
     };
+    let (resume_tx, _resume_rx) = watch::channel(0u64);
+    #[cfg(windows)]
+    crate::power::listen_for_resume(resume_tx.clone());
     let mut live = Live {
         client,
         secret: Arc::new(Mutex::new(None)),
         state: Arc::new(Mutex::new(LocalState::load())),
         generation: Arc::new(AtomicU64::new(0)),
         stop: None,
+        resume_tx,
         events,
     };
     if let Some(creds) = initial {
@@ -207,6 +213,7 @@ impl Live {
         let events = self.events.clone();
         let state = Arc::clone(&self.state);
         let secret = Arc::clone(&self.secret);
+        let resume = self.resume_tx.subscribe();
         tokio::spawn(async move {
             run_push(PushRun {
                 client,
@@ -214,6 +221,7 @@ impl Live {
                 epoch,
                 flag,
                 stop: stop_rx,
+                resume,
                 events,
                 state,
                 secret,
@@ -367,6 +375,7 @@ struct PushRun {
     epoch: u64,
     flag: Arc<AtomicU64>,
     stop: watch::Receiver<bool>,
+    resume: watch::Receiver<u64>,
     events: UnboundedSender<SessionEvent>,
     state: Arc<Mutex<LocalState>>,
     secret: Arc<Mutex<Option<String>>>,
@@ -379,6 +388,7 @@ async fn run_push(push: PushRun) {
         epoch,
         flag,
         mut stop,
+        resume,
         events,
         state,
         secret,
@@ -441,7 +451,7 @@ async fn run_push(push: PushRun) {
 
     tracing::info!("connecting push websocket");
     let push = PushLoop::new(creds.device_id.clone(), creds.secret.clone());
-    let (_task, mut frames) = push.spawn(stop.clone());
+    let (_task, mut frames) = push.spawn(stop.clone(), resume);
     let mut nag = tokio::time::interval(EMERGENCY_REPEAT);
     nag.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     nag.tick().await;
@@ -572,17 +582,22 @@ async fn sync_messages(
         shown_through,
         startup,
     );
+    let known: Vec<u64> = load_message_log()
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
+    let toasts = without_known_ids(plan.toasts, &known);
 
     if still_current(flag, epoch) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or(0);
-        append_message_log(&entries_for_toasts(&messages, &plan.toasts, now));
+        append_message_log(&entries_for_toasts(&messages, &toasts, now));
     }
 
     let mut emergencies = Vec::new();
-    for toast in plan.toasts {
+    for toast in toasts {
         if !still_current(flag, epoch) {
             return Ok(SyncReport {
                 discarded: plan.discarded,
