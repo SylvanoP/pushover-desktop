@@ -120,7 +120,87 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod imp {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixDatagram;
+    use std::sync::OnceLock;
+
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+
+    struct Primary {
+        _lock: std::fs::File,
+        socket: UnixDatagram,
+    }
+
+    static PRIMARY: OnceLock<Primary> = OnceLock::new();
+
+    pub fn claim_primary() -> bool {
+        let Some(dir) = openover_core::default_state_path()
+            .parent()
+            .map(std::path::Path::to_path_buf)
+        else {
+            return true;
+        };
+        if std::fs::create_dir_all(&dir).is_err() {
+            return true;
+        }
+        let Ok(lock) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("instance.lock"))
+        else {
+            return true;
+        };
+        if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+            return false;
+        }
+        let socket_path = dir.join("instance.sock");
+        let _ = std::fs::remove_file(&socket_path);
+        let Ok(socket) = UnixDatagram::bind(&socket_path) else {
+            return true;
+        };
+        let _ = PRIMARY.set(Primary {
+            _lock: lock,
+            socket,
+        });
+        true
+    }
+
+    pub fn signal_running_instance() {
+        let state = openover_core::default_state_path();
+        let Some(dir) = state.parent() else {
+            return;
+        };
+        let Ok(socket) = UnixDatagram::unbound() else {
+            return;
+        };
+        let path = dir.join("instance.sock");
+        for _ in 0..20 {
+            if socket.send_to(&[1], &path).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    pub fn wait_for_activate() -> bool {
+        let Some(primary) = PRIMARY.get() else {
+            return false;
+        };
+        let mut byte = [0];
+        primary.socket.recv(&mut byte).is_ok()
+    }
+
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod imp {
     pub fn claim_primary() -> bool {
         true

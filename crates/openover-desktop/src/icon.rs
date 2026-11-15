@@ -9,7 +9,7 @@ pub fn tray_image() -> image::RgbaImage {
 }
 
 /// The existing mark, plus a small red dot while `unread` is set.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn tray_image_with_dot(unread: bool) -> image::RgbaImage {
     let mut image = tray_image();
     if unread {
@@ -18,7 +18,7 @@ pub(crate) fn tray_image_with_dot(unread: bool) -> image::RgbaImage {
     image
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn paint_unread_dot(image: &mut image::RgbaImage) {
     let width = image.width();
     let height = image.height();
@@ -104,5 +104,21 @@ mod tests {
             assert_eq!(u16::from_le_bytes([bytes[entry + 6], bytes[entry + 7]]), 32);
         }
         assert_eq!(sizes, [16, 32, 64]);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn unread_dot_paints_red_without_covering_the_mark() {
+        let plain = decode(include_bytes!("../assets/openover-32.png"));
+        let mut dotted = plain.clone();
+        super::paint_unread_dot(&mut dotted);
+        let (width, height) = dotted.dimensions();
+        let radius = (width.min(height) / 6).clamp(2, 10);
+        let dot = dotted.get_pixel(width - radius - 1, height - radius - 1).0;
+        assert_eq!(dot, [220, 32, 32, 255]);
+        assert_eq!(
+            dotted.get_pixel(width / 2, height / 2).0,
+            plain.get_pixel(width / 2, height / 2).0
+        );
     }
 }

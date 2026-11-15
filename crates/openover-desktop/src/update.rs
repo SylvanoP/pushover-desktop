@@ -1,17 +1,22 @@
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "macos"))]
 use std::time::Duration;
 
+#[cfg(not(target_os = "macos"))]
 pub const RELEASES_LATEST: &str =
     "https://api.github.com/repos/SylvanoP/pushover-desktop/releases/latest";
+#[cfg(any(not(target_os = "macos"), test))]
 pub const WINDOWS_ASSET: &str = "openover-desktop-windows-x64.exe";
 
+#[cfg(any(not(target_os = "macos"), test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseAsset {
     pub version: String,
     pub url: String,
 }
 
+#[cfg(not(target_os = "macos"))]
 #[derive(Debug)]
 pub enum CheckOutcome {
     Current,
@@ -23,6 +28,7 @@ pub enum CheckOutcome {
     Failed(String),
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 pub fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
     let text = text.trim().trim_start_matches('v');
     let mut parts = text.split('.');
@@ -35,6 +41,7 @@ pub fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 pub fn is_newer(current: &str, tag: &str) -> bool {
     match (parse_version(current), parse_version(tag)) {
         (Some(current), Some(tag)) => tag > current,
@@ -42,6 +49,7 @@ pub fn is_newer(current: &str, tag: &str) -> bool {
     }
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 pub fn parse_latest_release(body: &str) -> Result<ReleaseAsset, &'static str> {
     let value: serde_json::Value = serde_json::from_str(body).map_err(|_| "Release unlesbar")?;
     let tag = value
@@ -75,11 +83,13 @@ pub fn parse_latest_release(body: &str) -> Result<ReleaseAsset, &'static str> {
     })
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 pub fn offer_for(current: &str, body: &str) -> Option<ReleaseAsset> {
     let release = parse_latest_release(body).ok()?;
     is_newer(current, &release.version).then_some(release)
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn check_now() -> CheckOutcome {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -91,6 +101,7 @@ pub fn check_now() -> CheckOutcome {
     runtime.block_on(check_async())
 }
 
+#[cfg(not(target_os = "macos"))]
 async fn check_async() -> CheckOutcome {
     let body = match fetch_latest().await {
         Ok(body) => body,
@@ -120,12 +131,13 @@ async fn store_newer_release(release: ReleaseAsset) -> CheckOutcome {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 async fn store_newer_release(release: ReleaseAsset) -> CheckOutcome {
     let _ = release;
     CheckOutcome::Failed("Update gibt es nur für Windows".into())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .user_agent(openover_core::USER_AGENT)
@@ -134,6 +146,7 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|_| "Netzwerk nicht bereit".to_string())
 }
 
+#[cfg(not(target_os = "macos"))]
 async fn fetch_latest() -> Result<String, String> {
     let response = client()?
         .get(RELEASES_LATEST)

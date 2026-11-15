@@ -53,7 +53,7 @@ fn logout(_: &Logout, cx: &mut App) {
 }
 
 pub fn set_unread_dot(cx: &mut App, unread: bool) {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let async_cx = cx.to_async();
         cx.foreground_executor()
@@ -62,13 +62,13 @@ pub fn set_unread_dot(cx: &mut App, unread: bool) {
             })
             .detach();
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (cx, unread);
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn apply_unread_icon(cx: &mut App, unread: bool) {
     let Some(tray) = cx.try_global::<AppTray>().map(|tray| tray.0.clone()) else {
         return;

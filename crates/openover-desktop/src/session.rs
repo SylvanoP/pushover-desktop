@@ -30,7 +30,6 @@ pub enum SessionCommand {
         enabled: bool,
         volume: u8,
     },
-    #[cfg(windows)]
     OpenMessage {
         id: u64,
     },
@@ -74,36 +73,15 @@ pub enum SessionEvent {
     Status(String),
     TwoFactorRequired,
     LoginFailed(String),
-    LoggedIn {
-        epoch: u64,
-    },
-    LoggedOut {
-        epoch: u64,
-    },
-    Notify {
-        epoch: u64,
-        toast: Toast,
-    },
-    EmergencyAcknowledged {
-        receipt: String,
-    },
-    Connection {
-        epoch: u64,
-        state: Connection,
-    },
-    BacklogDropped {
-        epoch: u64,
-        count: usize,
-    },
-    SessionLost {
-        epoch: u64,
-        message: String,
-    },
+    LoggedIn { epoch: u64 },
+    LoggedOut { epoch: u64 },
+    Notify { epoch: u64, toast: Toast },
+    EmergencyAcknowledged { receipt: String },
+    Connection { epoch: u64, state: Connection },
+    BacklogDropped { epoch: u64, count: usize },
+    SessionLost { epoch: u64, message: String },
     Activate,
-    #[cfg(windows)]
-    OpenMessage {
-        id: u64,
-    },
+    OpenMessage { id: u64 },
 }
 
 pub fn start(
@@ -156,7 +134,7 @@ async fn session_main(
     };
     let (resume_tx, _resume_rx) = watch::channel(0u64);
     let (network_tx, _network_rx) = watch::channel(0u64);
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         crate::power::listen_for_resume(resume_tx.clone());
         crate::network::listen_for_network(network_tx.clone());
@@ -190,7 +168,6 @@ async fn session_main(
             SessionCommand::Acknowledge { receipt } => live.acknowledge(&receipt).await,
             SessionCommand::Logout => live.logout().await,
             SessionCommand::SetSound { enabled, volume } => live.set_sound(enabled, volume),
-            #[cfg(windows)]
             SessionCommand::OpenMessage { id } => {
                 let _ = live.events.unbounded_send(SessionEvent::OpenMessage { id });
             }

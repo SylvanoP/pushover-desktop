@@ -22,6 +22,13 @@ pub fn mci_volume(volume: u8) -> u32 {
     u32::from(volume.min(100)) * 10
 }
 
+/// `afplay -v` wants 0.00–1.00. Values above 100 stay at full volume.
+#[cfg(any(target_os = "macos", test))]
+pub fn afplay_volume(volume: u8) -> String {
+    let volume = volume.min(100);
+    format!("{}.{:02}", volume / 100, volume % 100)
+}
+
 #[cfg(windows)]
 mod playback {
     use std::path::{Path, PathBuf};
@@ -115,12 +122,48 @@ mod playback {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod playback {
+    use std::path::{Path, PathBuf};
+
+    pub fn play(path: PathBuf, volume: u8) {
+        std::thread::Builder::new()
+            .name("openover-sound".into())
+            .spawn(move || {
+                if let Err(err) = play_blocking(&path, volume) {
+                    tracing::warn!("could not play sound: {err}");
+                }
+            })
+            .ok();
+    }
+
+    pub fn play_and_wait(path: PathBuf, volume: u8) {
+        if let Err(err) = play_blocking(&path, volume) {
+            tracing::warn!("could not play sound: {err}");
+        }
+    }
+
+    fn play_blocking(path: &Path, volume: u8) -> Result<(), String> {
+        let status = std::process::Command::new("afplay")
+            .arg("-v")
+            .arg(super::afplay_volume(volume))
+            .arg(path)
+            .status()
+            .map_err(|err| err.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("afplay exited {status}"))
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod playback {
     use std::path::PathBuf;
 
     pub fn play(_path: PathBuf, _volume: u8) {
-        tracing::info!("sound playback is implemented on Windows only");
+        tracing::info!("sound playback is implemented on Windows and macOS");
     }
 
     pub fn play_and_wait(path: PathBuf, volume: u8) {
@@ -138,5 +181,18 @@ mod tests {
         assert_eq!(mci_volume(40), 400);
         assert_eq!(mci_volume(100), 1000);
         assert_eq!(mci_volume(255), 1000);
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::afplay_volume;
+
+    #[test]
+    fn afplay_volume_maps_percent_onto_the_unit_interval() {
+        assert_eq!(afplay_volume(0), "0.00");
+        assert_eq!(afplay_volume(40), "0.40");
+        assert_eq!(afplay_volume(100), "1.00");
+        assert_eq!(afplay_volume(255), "1.00");
     }
 }

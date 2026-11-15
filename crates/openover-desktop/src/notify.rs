@@ -4,11 +4,65 @@
 //! from inside `cx.update` makes GPUI's resize and inset callbacks fail their
 //! re-entrant borrow and log `RefCell already borrowed` as an error.
 
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use gpui::{App, SystemNotification};
 
 use crate::session::SessionCommands;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationAction {
+    Acknowledge(String),
+    Open(u64),
+}
+
+/// Body click uses `launch` (the message id). An acknowledge button stays on
+/// the message and does not open it.
+pub fn notification_action(
+    action_id: Option<&str>,
+    launch: Option<&str>,
+) -> Option<NotificationAction> {
+    if let Some(action) = action_id {
+        if let Some(receipt) = action.strip_prefix("ack:")
+            && !receipt.is_empty()
+        {
+            return Some(NotificationAction::Acknowledge(receipt.to_string()));
+        }
+        return None;
+    }
+    let id = launch?.parse().ok()?;
+    Some(NotificationAction::Open(id))
+}
+
+fn launches() -> &'static Mutex<HashMap<String, String>> {
+    static LAUNCHES: LazyLock<Mutex<HashMap<String, String>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    &LAUNCHES
+}
+
+pub fn remember_launch(tag: &str, launch: &str) {
+    if tag.is_empty() || launch.is_empty() {
+        return;
+    }
+    launches()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .insert(tag.to_string(), launch.to_string());
+}
+
+pub fn launch_for(tag: &str) -> Option<String> {
+    launches()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(tag)
+        .cloned()
+}
+
 pub fn present(cx: &mut App, notification: SystemNotification, launch: Option<String>) {
+    if let Some(launch) = launch.as_deref().filter(|launch| !launch.is_empty()) {
+        remember_launch(notification.tag.as_ref(), launch);
+    }
     let commands = cx
         .try_global::<SessionCommands>()
         .map(|commands| commands.0.clone());
@@ -186,5 +240,34 @@ mod windows_toast {
         audio.SetAttribute(h!("silent"), h!("true"))?;
         toast.AppendChild(&audio)?;
         Ok(document)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NotificationAction, notification_action};
+
+    #[test]
+    fn body_click_opens_the_launched_message() {
+        assert_eq!(
+            notification_action(None, Some("42")),
+            Some(NotificationAction::Open(42))
+        );
+    }
+
+    #[test]
+    fn acknowledge_stays_on_the_message() {
+        assert_eq!(
+            notification_action(Some("ack:receipt-1"), Some("42")),
+            Some(NotificationAction::Acknowledge("receipt-1".into()))
+        );
+        assert_eq!(notification_action(Some("ack:"), Some("42")), None);
+    }
+
+    #[test]
+    fn a_click_without_a_launch_does_nothing() {
+        assert_eq!(notification_action(None, None), None);
+        assert_eq!(notification_action(None, Some("")), None);
+        assert_eq!(notification_action(None, Some("demo")), None);
     }
 }

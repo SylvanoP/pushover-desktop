@@ -39,6 +39,7 @@ enum Pane {
     Messages,
 }
 
+#[cfg(not(target_os = "macos"))]
 enum UpdateLine {
     Idle,
     Checking,
@@ -72,11 +73,13 @@ pub struct Settings {
     status: SharedString,
     pending_emergency: Option<(String, String)>,
     unread: UnreadDot,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     start_with_windows: bool,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     autostart_note: SharedString,
+    #[cfg(not(target_os = "macos"))]
     update_busy: bool,
+    #[cfg(not(target_os = "macos"))]
     update_line: UpdateLine,
     _subscriptions: Vec<Subscription>,
 }
@@ -123,11 +126,13 @@ impl Settings {
             status: SharedString::default(),
             pending_emergency: None,
             unread,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             start_with_windows: remembered_autostart(),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             autostart_note: SharedString::default(),
+            #[cfg(not(target_os = "macos"))]
             update_busy: false,
+            #[cfg(not(target_os = "macos"))]
             update_line: UpdateLine::Idle,
             _subscriptions: subscriptions,
         }
@@ -361,7 +366,6 @@ impl Settings {
                 open_settings = true;
             }
             SessionEvent::Activate => open_settings = true,
-            #[cfg(windows)]
             SessionEvent::OpenMessage { id } => {
                 self.reload_messages();
                 self.pane = Pane::Messages;
@@ -387,6 +391,7 @@ impl Settings {
         cx.notify();
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn start_update_check(&mut self, cx: &mut Context<Self>) {
         if self.update_busy {
             return;
@@ -419,6 +424,7 @@ impl Settings {
         .detach();
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn finish_update_check(
         &mut self,
         outcome: crate::update::CheckOutcome,
@@ -454,7 +460,7 @@ impl Settings {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn toggle_autostart(&mut self, cx: &mut Context<Self>) {
         let next = !self.start_with_windows;
         if let Err(err) = crate::startup::write_enabled(next) {
@@ -685,11 +691,14 @@ fn preferences_pane(
             "Gerätename",
             field_chrome(div(), theme, false).child(shown_name),
         ));
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     let pane = pane.child(autostart_row(settings, theme, cx));
-    pane.child(update_row(settings, theme, cx))
+    #[cfg(not(target_os = "macos"))]
+    let pane = pane.child(update_row(settings, theme, cx));
+    pane
 }
 
+#[cfg(not(target_os = "macos"))]
 fn update_row(
     settings: &Settings,
     theme: &FormTheme,
@@ -728,6 +737,7 @@ fn update_row(
         .child(update_actions(settings, theme, busy, cx))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn update_actions(
     settings: &Settings,
     theme: &FormTheme,
@@ -745,6 +755,7 @@ fn update_actions(
     append_restart(row, settings, theme, cx)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn append_restart(
     row: gpui::Div,
     settings: &Settings,
@@ -774,7 +785,19 @@ fn append_restart(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
+fn autostart_label() -> &'static str {
+    #[cfg(windows)]
+    {
+        "Mit Windows starten"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "Beim Anmelden starten"
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
 fn autostart_row(
     settings: &Settings,
     theme: &FormTheme,
@@ -797,7 +820,7 @@ fn autostart_row(
             )
             .cursor_pointer()
             .justify_between()
-            .child("Mit Windows starten")
+            .child(autostart_label())
             .child(
                 div()
                     .text_color(if settings.start_with_windows {
@@ -1283,6 +1306,13 @@ fn show_backlog_toast(cx: &mut App, count: usize) {
     }, None);
 }
 
+fn send_open_message(cx: &mut App, id: u64) {
+    let Some(commands) = cx.try_global::<SessionCommands>() else {
+        return;
+    };
+    let _ = commands.0.send(SessionCommand::OpenMessage { id });
+}
+
 fn send_acknowledge(cx: &mut App, receipt: &str) {
     let Some(commands) = cx.try_global::<SessionCommands>() else {
         return;
@@ -1338,19 +1368,21 @@ pub fn install(cx: &mut App, background: bool) {
     } else {
         crate::tray::set_tooltip_text(cx, Connection::SignedOut.tooltip());
     }
+    #[cfg(not(target_os = "macos"))]
     settings.update(cx, |this, cx| this.start_update_check(cx));
     if !background || !has_session {
         open_settings_window(cx);
     }
 
     cx.on_system_notification_response(|response, cx| {
-        let Some(action) = response.action_id else {
-            return;
-        };
-        let Some(receipt) = action.strip_prefix("ack:") else {
-            return;
-        };
-        send_acknowledge(cx, receipt);
+        let launch = crate::notify::launch_for(response.tag.as_ref());
+        match crate::notify::notification_action(response.action_id.as_deref(), launch.as_deref()) {
+            Some(crate::notify::NotificationAction::Acknowledge(receipt)) => {
+                send_acknowledge(cx, &receipt);
+            }
+            Some(crate::notify::NotificationAction::Open(id)) => send_open_message(cx, id),
+            None => {}
+        }
     });
 
     let (activate_tx, activate_rx) = futures_channel::mpsc::unbounded();
@@ -1445,7 +1477,7 @@ const fn allow_window_close() -> bool {
     false
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn remembered_autostart() -> bool {
     let enabled = crate::startup::read_enabled();
     if enabled && let Err(err) = crate::startup::write_enabled(true) {

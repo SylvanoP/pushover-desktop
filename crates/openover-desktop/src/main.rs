@@ -3,11 +3,11 @@
 mod form_theme;
 mod icon;
 mod instance;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod network;
 mod notify;
 mod password_field;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 mod power;
 mod session;
 mod settings;
