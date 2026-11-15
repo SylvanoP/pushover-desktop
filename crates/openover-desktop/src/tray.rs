@@ -52,6 +52,35 @@ fn logout(_: &Logout, cx: &mut App) {
     }
 }
 
+pub fn set_unread_dot(cx: &mut App, unread: bool) {
+    #[cfg(windows)]
+    {
+        let async_cx = cx.to_async();
+        cx.foreground_executor()
+            .spawn(async move {
+                async_cx.update(|cx| apply_unread_icon(cx, unread));
+            })
+            .detach();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (cx, unread);
+    }
+}
+
+#[cfg(windows)]
+fn apply_unread_icon(cx: &mut App, unread: bool) {
+    let Some(tray) = cx.try_global::<AppTray>().map(|tray| tray.0.clone()) else {
+        return;
+    };
+    let image = crate::icon::tray_image_with_dot(unread);
+    let (width, height) = image.dimensions();
+    let Ok(icon) = Icon::from_rgba(image.into_raw(), width, height).build() else {
+        return;
+    };
+    let _ = tray.set_icon(icon, cx);
+}
+
 pub fn set_tooltip_text(cx: &mut App, text: &str) {
     let text = text.to_string();
     let async_cx = cx.to_async();

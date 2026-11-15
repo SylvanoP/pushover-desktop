@@ -8,6 +8,42 @@ pub fn tray_image() -> image::RgbaImage {
     decode(tray_bytes())
 }
 
+/// The existing mark, plus a small red dot while `unread` is set.
+#[cfg(windows)]
+pub(crate) fn tray_image_with_dot(unread: bool) -> image::RgbaImage {
+    let mut image = tray_image();
+    if unread {
+        paint_unread_dot(&mut image);
+    }
+    image
+}
+
+#[cfg(windows)]
+fn paint_unread_dot(image: &mut image::RgbaImage) {
+    let width = image.width();
+    let height = image.height();
+    if width < 4 || height < 4 {
+        return;
+    }
+    let radius = (width.min(height) / 6).clamp(2, 10);
+    let center_x = width - radius - 1;
+    let center_y = height - radius - 1;
+    let limit = radius * radius;
+    let x0 = center_x.saturating_sub(radius);
+    let y0 = center_y.saturating_sub(radius);
+    let x1 = (center_x + radius).min(width - 1);
+    let y1 = (center_y + radius).min(height - 1);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let dx = x.abs_diff(center_x);
+            let dy = y.abs_diff(center_y);
+            if dx * dx + dy * dy <= limit {
+                image.put_pixel(x, y, image::Rgba([220, 32, 32, 255]));
+            }
+        }
+    }
+}
+
 fn decode(bytes: &[u8]) -> image::RgbaImage {
     image::load_from_memory(bytes)
         .expect("Openover icon")

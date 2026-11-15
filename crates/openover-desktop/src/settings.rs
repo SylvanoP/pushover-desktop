@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::form_theme::{FormTheme, field_chrome, field_height};
 use crate::password_field::MaskedPassword;
 use crate::session::{Connection, SessionCommand, SessionCommands, SessionEvent};
+use crate::unread::{DotEvent, UnreadDot, unread_dot};
 
 use futures_util::StreamExt as _;
 use gpui::{
@@ -70,6 +71,7 @@ pub struct Settings {
     epoch: u64,
     status: SharedString,
     pending_emergency: Option<(String, String)>,
+    unread: UnreadDot,
     #[cfg(windows)]
     start_with_windows: bool,
     #[cfg(windows)]
@@ -97,6 +99,8 @@ impl Settings {
             cx.subscribe(&email, |_, _, _: &TextChanged, cx| cx.notify()),
             cx.subscribe(&twofa, |_, _, _: &TextChanged, cx| cx.notify()),
         ];
+        let messages = openover_core::load_message_log();
+        let unread = UnreadDot::at_start(false, messages.iter().map(|message| message.id));
 
         Self {
             email,
@@ -112,12 +116,13 @@ impl Settings {
             sound_volume: clamp_volume(stored.sound_volume),
             dragging_volume: false,
             volume_bounds: None,
-            messages: openover_core::load_message_log(),
+            messages,
             confirm_clear: false,
             selected_id: None,
             epoch: 0,
             status: SharedString::default(),
             pending_emergency: None,
+            unread,
             #[cfg(windows)]
             start_with_windows: remembered_autostart(),
             #[cfg(windows)]
@@ -308,6 +313,7 @@ impl Settings {
                 if !self.accept_epoch(epoch) {
                     return false;
                 }
+                self.note_dot(DotEvent::Message(toast.message_id), cx);
                 show_toast(cx, &toast, self.sound_enabled, self.sound_volume);
                 self.reload_messages();
                 if let Some(receipt) = toast.receipt.clone() {
@@ -365,6 +371,15 @@ impl Settings {
         }
         cx.notify();
         open_settings
+    }
+
+    fn note_dot(&mut self, event: DotEvent, cx: &mut Context<Self>) {
+        let next = unread_dot(self.unread.clone(), event);
+        let changed = next.shows() != self.unread.shows();
+        self.unread = next;
+        if changed {
+            crate::tray::set_unread_dot(cx, self.unread.shows());
+        }
     }
 
     fn set_status(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -1307,10 +1322,10 @@ pub fn install(cx: &mut App, background: bool) {
 
     let initial = CredentialStore::load().ok();
     let has_session = initial.is_some();
+    // Snapshot the log before the session thread can append a live message.
+    let settings = settings_entity(cx);
     let (commands, events) = crate::session::start(initial);
     cx.set_global(SessionCommands(commands));
-
-    let settings = settings_entity(cx);
     if has_session {
         settings.update(cx, |this, cx| {
             this.logged_in = true;
@@ -1377,6 +1392,7 @@ pub fn open_settings_window_with_token(token: Option<&str>, cx: &mut App) {
             .update(cx, |_settings, window, _cx| reveal(window, token))
             .is_ok()
     {
+        mark_window(DotEvent::Revealed, cx);
         cx.activate(true);
         return;
     }
@@ -1393,8 +1409,9 @@ pub fn open_settings_window_with_token(token: Option<&str>, cx: &mut App) {
             }))
             .icon(Some(crate::icon::window_image())),
         move |window, cx| {
-            window.on_window_should_close(cx, |window, _cx| {
+            window.on_window_should_close(cx, |window, cx| {
                 window.set_visible(false);
+                mark_window(DotEvent::Hidden, cx);
                 allow_window_close()
             });
             if !view.read(cx).logged_in {
@@ -1405,10 +1422,15 @@ pub fn open_settings_window_with_token(token: Option<&str>, cx: &mut App) {
     ) {
         Ok(handle) => {
             cx.set_global(SettingsWindow(handle));
+            mark_window(DotEvent::Revealed, cx);
             cx.activate(true);
         }
         Err(err) => tracing::error!("settings window failed: {err}"),
     }
+}
+
+fn mark_window(event: DotEvent, cx: &mut App) {
+    settings_entity(cx).update(cx, |settings, cx| settings.note_dot(event, cx));
 }
 
 fn reveal(window: &mut Window, token: Option<&str>) {

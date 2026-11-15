@@ -14,6 +14,7 @@ mod settings;
 mod sound;
 mod startup;
 mod tray;
+mod unread;
 mod update;
 
 extern crate gpui_ce_backend as gpui;
