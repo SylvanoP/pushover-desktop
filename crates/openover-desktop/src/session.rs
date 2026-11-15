@@ -136,6 +136,7 @@ struct Live {
     generation: Arc<AtomicU64>,
     stop: Option<watch::Sender<bool>>,
     resume_tx: watch::Sender<u64>,
+    network_tx: watch::Sender<u64>,
     events: UnboundedSender<SessionEvent>,
 }
 
@@ -154,8 +155,12 @@ async fn session_main(
         }
     };
     let (resume_tx, _resume_rx) = watch::channel(0u64);
+    let (network_tx, _network_rx) = watch::channel(0u64);
     #[cfg(windows)]
-    crate::power::listen_for_resume(resume_tx.clone());
+    {
+        crate::power::listen_for_resume(resume_tx.clone());
+        crate::network::listen_for_network(network_tx.clone());
+    }
     let mut live = Live {
         client,
         secret: Arc::new(Mutex::new(None)),
@@ -163,6 +168,7 @@ async fn session_main(
         generation: Arc::new(AtomicU64::new(0)),
         stop: None,
         resume_tx,
+        network_tx,
         events,
     };
     if let Some(creds) = initial {
@@ -214,6 +220,7 @@ impl Live {
         let state = Arc::clone(&self.state);
         let secret = Arc::clone(&self.secret);
         let resume = self.resume_tx.subscribe();
+        let network = self.network_tx.subscribe();
         tokio::spawn(async move {
             run_push(PushRun {
                 client,
@@ -222,6 +229,7 @@ impl Live {
                 flag,
                 stop: stop_rx,
                 resume,
+                network,
                 events,
                 state,
                 secret,
@@ -376,6 +384,7 @@ struct PushRun {
     flag: Arc<AtomicU64>,
     stop: watch::Receiver<bool>,
     resume: watch::Receiver<u64>,
+    network: watch::Receiver<u64>,
     events: UnboundedSender<SessionEvent>,
     state: Arc<Mutex<LocalState>>,
     secret: Arc<Mutex<Option<String>>>,
@@ -389,6 +398,7 @@ async fn run_push(push: PushRun) {
         flag,
         mut stop,
         resume,
+        network,
         events,
         state,
         secret,
@@ -451,7 +461,7 @@ async fn run_push(push: PushRun) {
 
     tracing::info!("connecting push websocket");
     let push = PushLoop::new(creds.device_id.clone(), creds.secret.clone());
-    let (_task, mut frames) = push.spawn(stop.clone(), resume);
+    let (_task, mut frames) = push.spawn(stop.clone(), resume, network);
     let mut nag = tokio::time::interval(EMERGENCY_REPEAT);
     nag.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     nag.tick().await;

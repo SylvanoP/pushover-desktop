@@ -67,10 +67,13 @@ impl PushLoop {
 
     /// `stop` flips to `true` to drop the socket and end the task.
     /// `resume` increments when the machine leaves sleep.
+    /// `network` increments when the link changes. That aborts the hung read
+    /// the same way resume does.
     pub fn spawn(
         self,
         mut stop: watch::Receiver<bool>,
         mut resume: watch::Receiver<u64>,
+        mut network: watch::Receiver<u64>,
     ) -> (
         tokio::task::JoinHandle<()>,
         mpsc::UnboundedReceiver<PushLoopEvent>,
@@ -84,7 +87,7 @@ impl PushLoop {
                     break;
                 }
                 match self
-                    .run_session(&tx, &mut stop, &mut resume, &mut catch_up)
+                    .run_session(&tx, &mut stop, &mut resume, &mut network, &mut catch_up)
                     .await
                 {
                     Ok(StopReason::Shutdown) | Ok(StopReason::Fatal) => break,
@@ -111,12 +114,15 @@ impl PushLoop {
                                     break;
                                 }
                             }
-                            changed = resume.changed() => {
-                                if changed.is_err() {
+                            link = link_changed(&mut resume, &mut network) => {
+                                let Ok(signal) = link else {
                                     break;
+                                };
+                                let plan = recover_link(signal);
+                                if plan.fetch {
+                                    quick = true;
+                                    catch_up = true;
                                 }
-                                quick = true;
-                                catch_up = true;
                             }
                             _ = tokio::time::sleep(backoff) => {}
                         }
@@ -140,6 +146,7 @@ impl PushLoop {
         tx: &mpsc::UnboundedSender<PushLoopEvent>,
         stop: &mut watch::Receiver<bool>,
         resume: &mut watch::Receiver<u64>,
+        network: &mut watch::Receiver<u64>,
         catch_up: &mut bool,
     ) -> Result<StopReason, WebSocketError> {
         loop {
@@ -150,12 +157,13 @@ impl PushLoop {
             let connected = race(
                 stop,
                 resume,
+                network,
                 tokio::time::timeout(CONNECT_LIMIT, connect_async(request)),
             )
             .await;
             let (mut ws, _) = match connected {
                 Race::Shutdown => return Ok(StopReason::Shutdown),
-                Race::Resume => return Err(WebSocketError::Resume),
+                Race::Link(signal) => return Err(link_break(signal)),
                 Race::Again => continue,
                 Race::Ready(Ok(Ok(pair))) => pair,
                 Race::Ready(Ok(Err(err))) => return Err(WebSocketError::Connect(Box::new(err))),
@@ -168,12 +176,13 @@ impl PushLoop {
             let sent = race(
                 stop,
                 resume,
+                network,
                 tokio::time::timeout(CONNECT_LIMIT, ws.send(Message::Text(login.into()))),
             )
             .await;
             match sent {
                 Race::Shutdown => return Ok(StopReason::Shutdown),
-                Race::Resume => return Err(WebSocketError::Resume),
+                Race::Link(signal) => return Err(link_break(signal)),
                 Race::Again => continue,
                 Race::Ready(Ok(Ok(()))) => {}
                 Race::Ready(Ok(Err(err))) => return Err(WebSocketError::Dropped(Box::new(err))),
@@ -182,7 +191,7 @@ impl PushLoop {
             for event in session_opened(catch_up) {
                 let _ = tx.send(event);
             }
-            return read_frames(&mut ws, tx, stop, resume, PUSH_IDLE).await;
+            return read_frames(&mut ws, tx, stop, resume, network, PUSH_IDLE).await;
         }
     }
 }
@@ -190,13 +199,20 @@ impl PushLoop {
 enum Race<T> {
     Ready(T),
     Shutdown,
-    Resume,
+    Link(LinkSignal),
     Again,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkSignal {
+    Resume,
+    Network,
 }
 
 async fn race<T>(
     stop: &mut watch::Receiver<bool>,
     resume: &mut watch::Receiver<u64>,
+    network: &mut watch::Receiver<u64>,
     fut: impl Future<Output = T>,
 ) -> Race<T> {
     tokio::pin!(fut);
@@ -209,24 +225,70 @@ async fn race<T>(
                 Race::Again
             }
         }
-        changed = resume.changed() => {
-            if changed.is_err() {
-                Race::Shutdown
-            } else {
-                Race::Resume
-            }
-        }
+        link = link_changed(resume, network) => match link {
+            Ok(signal) => Race::Link(signal),
+            Err(()) => Race::Shutdown,
+        },
         value = &mut fut => Race::Ready(value),
     }
 }
 
+async fn link_changed(
+    resume: &mut watch::Receiver<u64>,
+    network: &mut watch::Receiver<u64>,
+) -> Result<LinkSignal, ()> {
+    tokio::select! {
+        biased;
+        changed = resume.changed() => {
+            if changed.is_err() {
+                Err(())
+            } else {
+                Ok(LinkSignal::Resume)
+            }
+        }
+        changed = network.changed() => {
+            if changed.is_err() {
+                Err(())
+            } else {
+                Ok(LinkSignal::Network)
+            }
+        }
+    }
+}
+
+fn link_break(signal: LinkSignal) -> WebSocketError {
+    match signal {
+        LinkSignal::Resume => WebSocketError::Resume,
+        LinkSignal::Network => WebSocketError::Network,
+    }
+}
+
+/// Sleep and a network change leave the same TCP read hung. Either signal
+/// aborts it, reconnects, and fetches messages missed while it was stuck.
+fn recover_link(signal: LinkSignal) -> Recovery {
+    match signal {
+        LinkSignal::Resume | LinkSignal::Network => Recovery {
+            reconnect: true,
+            fetch: true,
+        },
+    }
+}
+
+fn link_of(err: &WebSocketError) -> Option<LinkSignal> {
+    match err {
+        WebSocketError::Resume => Some(LinkSignal::Resume),
+        WebSocketError::Network => Some(LinkSignal::Network),
+        _ => None,
+    }
+}
+
 fn plan_recovery(err: &WebSocketError) -> Recovery {
+    if let Some(signal) = link_of(err) {
+        return recover_link(signal);
+    }
     let had_socket = matches!(
         err,
-        WebSocketError::Closed
-            | WebSocketError::Dropped(_)
-            | WebSocketError::Stalled
-            | WebSocketError::Resume
+        WebSocketError::Closed | WebSocketError::Dropped(_) | WebSocketError::Stalled
     );
     Recovery {
         reconnect: true,
@@ -261,6 +323,7 @@ async fn read_frames<S>(
     tx: &mpsc::UnboundedSender<PushLoopEvent>,
     stop: &mut watch::Receiver<bool>,
     resume: &mut watch::Receiver<u64>,
+    network: &mut watch::Receiver<u64>,
     idle: Duration,
 ) -> Result<StopReason, WebSocketError>
 where
@@ -277,11 +340,11 @@ where
                     return Ok(StopReason::Shutdown);
                 }
             }
-            changed = resume.changed() => {
-                if changed.is_err() {
-                    return Ok(StopReason::Shutdown);
-                }
-                return Err(WebSocketError::Resume);
+            link = link_changed(resume, network) => {
+                return match link {
+                    Ok(signal) => Err(link_break(signal)),
+                    Err(()) => Ok(StopReason::Shutdown),
+                };
             }
             _ = tokio::time::sleep(idle) => {
                 return Err(WebSocketError::Stalled);
@@ -368,6 +431,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fallbacks_stay_at_three_minutes_and_thirty_seconds() {
+        assert_eq!(PUSH_IDLE, Duration::from_secs(180));
+        assert_eq!(CONNECT_LIMIT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn network_change_fetches_like_resume() {
+        assert_eq!(
+            recover_link(LinkSignal::Network),
+            recover_link(LinkSignal::Resume)
+        );
+        let plan = recover_link(LinkSignal::Network);
+        assert!(plan.reconnect);
+        assert!(plan.fetch);
+        assert_eq!(plan_recovery(&link_break(LinkSignal::Network)), plan);
+        assert_eq!(plan_recovery(&link_break(LinkSignal::Resume)), plan);
+    }
+
+    #[test]
     fn decodes_protocol_frames_and_skips_whitespace() {
         assert_eq!(
             decode_push_text("#\n!RAE?"),
@@ -400,6 +482,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let (_stop_tx, mut stop) = watch::channel(false);
         let (_resume_tx, mut resume) = watch::channel(0u64);
+        let (_network_tx, mut network) = watch::channel(0u64);
         let mut ws = futures_util::stream::pending::<
             Result<Message, tokio_tungstenite::tungstenite::Error>,
         >();
@@ -410,6 +493,7 @@ mod tests {
                 &tx,
                 &mut stop,
                 &mut resume,
+                &mut network,
                 Duration::from_millis(30),
             ),
         )
@@ -431,6 +515,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let (_stop_tx, mut stop) = watch::channel(false);
         let (resume_tx, mut resume) = watch::channel(0u64);
+        let (_network_tx, mut network) = watch::channel(0u64);
         resume_tx.send(1).expect("resume signal");
         let mut ws = futures_util::stream::pending::<
             Result<Message, tokio_tungstenite::tungstenite::Error>,
@@ -442,6 +527,7 @@ mod tests {
                 &tx,
                 &mut stop,
                 &mut resume,
+                &mut network,
                 Duration::from_secs(300),
             ),
         )
@@ -450,6 +536,43 @@ mod tests {
         .expect_err("resume");
         assert!(matches!(end, WebSocketError::Resume));
         let (plan, events) = recover(&end);
+        assert!(plan.reconnect);
+        assert!(plan.fetch);
+        assert_eq!(
+            events,
+            vec![PushLoopEvent::Disconnected, PushLoopEvent::Sync]
+        );
+    }
+
+    #[tokio::test]
+    async fn network_signal_reconnects_and_fetches() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (_stop_tx, mut stop) = watch::channel(false);
+        let (_resume_tx, mut resume) = watch::channel(0u64);
+        let (network_tx, mut network) = watch::channel(0u64);
+        network_tx.send(1).expect("network signal");
+        let mut ws = futures_util::stream::pending::<
+            Result<Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+        let end = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_frames(
+                &mut ws,
+                &tx,
+                &mut stop,
+                &mut resume,
+                &mut network,
+                Duration::from_secs(300),
+            ),
+        )
+        .await
+        .expect("network change ends a stalled read")
+        .expect_err("network");
+        assert!(matches!(end, WebSocketError::Network));
+        let (plan, events) = recover(&end);
+        let (resume_plan, resume_events) = recover(&WebSocketError::Resume);
+        assert_eq!(plan, resume_plan);
+        assert_eq!(events, resume_events);
         assert!(plan.reconnect);
         assert!(plan.fetch);
         assert_eq!(

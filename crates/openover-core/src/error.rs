@@ -59,4 +59,7 @@ pub enum WebSocketError {
     /// Windows reported resume from sleep, or the resume watch fired.
     #[error("system resumed from sleep")]
     Resume,
+    /// A network change (WLAN, cable, or VPN) hung the same read as sleep.
+    #[error("network changed")]
+    Network,
 }

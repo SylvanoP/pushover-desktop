@@ -3,6 +3,8 @@
 mod form_theme;
 mod icon;
 mod instance;
+#[cfg(windows)]
+mod network;
 mod notify;
 mod password_field;
 #[cfg(windows)]
