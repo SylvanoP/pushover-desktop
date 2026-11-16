@@ -4524,7 +4524,7 @@ dependencies = [
 
 [[package]]
 name = "openover-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "futures-util",
  "keyring",
@@ -4540,7 +4540,7 @@ dependencies = [
 
 [[package]]
 name = "openover-desktop"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "futures-channel",

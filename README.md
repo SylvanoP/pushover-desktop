@@ -1,14 +1,17 @@
 # Openover Desktop
 
-**Deutsch (primär)** — Inoffizieller **Pushover Open Client**. Die veröffentlichte Datei gibt es nur für Windows. Tray-first: die App startet im System-Tray; das Fenster ist die Anmeldung und die Einstellungen.
+**Deutsch (primär)** — Inoffizieller **Pushover Open Client**. Veröffentlicht werden Builds für Windows und macOS. Tray-first: die App startet im System-Tray; das Fenster ist die Anmeldung und die Einstellungen.
 
 > **Disclaimer:** Dieses Projekt ist **nicht** von Pushover LLC veröffentlicht oder unterstützt. Pushover® ist eine Marke von Pushover LLC. Bitte beachtet die [Pushover Distribution Guidelines](https://pushover.net/api/client/#distribution-guidelines) (kein „Pushover for …“ im Namen, kein Pushover-Logo als App-Icon).
 
 **Lizenz für den Dienst:** Für Open-Client-Geräte ist eine [Pushover-Desktop-Lizenz](https://pushover.net/clients/desktop) erforderlich (30-Tage-Test, danach einmalig ~5 USD). Kauf und Account nur über [pushover.net](https://pushover.net/).
 
-**Download (nur Windows x64):** [openover-desktop-windows-x64.exe](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.2/openover-desktop-windows-x64.exe) aus dem Release [v0.1.2](https://github.com/SylvanoP/pushover-desktop/releases/tag/v0.1.2).
+**Download** aus dem Release [v0.1.3](https://github.com/SylvanoP/pushover-desktop/releases/tag/v0.1.3):
 
-**English (short):** Unofficial Pushover **Open Client** (`os=O`). Not affiliated with Pushover LLC. The app does not use the Pushover logo and is not named “Pushover for …”. The only published file is the Windows x64 build [openover-desktop-windows-x64.exe](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.2/openover-desktop-windows-x64.exe) on the [v0.1.2 release](https://github.com/SylvanoP/pushover-desktop/releases/tag/v0.1.2). A Pushover desktop license is required. The source is MIT-licensed.
+- Windows x64: [openover-desktop-windows-x64.exe](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.3/openover-desktop-windows-x64.exe)
+- macOS: [openover-desktop-macos.zip](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.3/openover-desktop-macos.zip). Das Zip enthält `Openover.app` im Wurzelverzeichnis. Die App ist ad hoc signiert und nicht notarisiert. Beim ersten Öffnen: Rechtsklick, dann „Öffnen“.
+
+**English (short):** Unofficial Pushover **Open Client** (`os=O`). Not affiliated with Pushover LLC. The app does not use the Pushover logo and is not named “Pushover for …”. The [v0.1.3 release](https://github.com/SylvanoP/pushover-desktop/releases/tag/v0.1.3) has two files: Windows x64 [openover-desktop-windows-x64.exe](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.3/openover-desktop-windows-x64.exe), and macOS [openover-desktop-macos.zip](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.3/openover-desktop-macos.zip), a zip of `Openover.app`. The Mac app is ad-hoc signed and not notarized, so the first open is right-click, then Open. A Pushover desktop license is required. The source is MIT-licensed.
 
 ## Status
 
@@ -16,7 +19,7 @@
 - Anmeldung im Einstellungsfenster (E-Mail, Passwort, optional 2FA, Gerätename)
 - `openover-core`: Login, Gerät `os=O`, Nachrichten, WebSocket mit Reconnect
 - Nach `!` werden neue Nachrichten als Systembenachrichtigung gezeigt (Titel, Text, App-Name)
-- Pushover-Sounds (`sounds/{code}.mp3`) werden lokal gecacht und unter Windows abgespielt. Priorität -1 bleibt stumm. Die Windows-Toasts selbst haben keinen Ton
+- Pushover-Sounds (`sounds/{code}.mp3`) werden lokal gecacht und unter Windows und macOS abgespielt. Priorität -1 bleibt stumm. Die Windows-Toasts selbst haben keinen Ton
 - Beim ersten Start wird eine große alte Warteschlange verworfen und einmal angezeigt. Die letzte Nachrichten-ID wird erst nach erfolgreichem Löschen gespeichert
 - Notfälle bleiben lokal und werden etwa alle 30 Sekunden erneut gezeigt, bis sie bestätigt sind
 - Tray: Einstellungen, Abmelden, Beenden. Der Tooltip zeigt den Verbindungszustand. Ein zweiter Start öffnet die laufende Instanz
