@@ -4,10 +4,11 @@ use std::time::Duration;
 
 use futures_channel::mpsc::UnboundedSender;
 use openover_core::{
-    ApiError, CredentialStore, LocalState, PendingEmergency, PushLoop, PushLoopEvent,
-    PushoverClient, StoredCredentials, Toast, append_message_log, clamp_volume,
-    cursor_after_delete, entries_for_toasts, load_message_log, plan_sync, wipe_secret,
-    without_known_ids,
+    ApiError, CredentialStore, FetchHealth, LiveSocket, LocalState, PendingEmergency, PushLoop,
+    PushLoopEvent, PushoverClient, SESSION_HEALTH_EVERY, SocketHealth, StoredCredentials, Toast,
+    append_message_log, clamp_volume, classify_socket, cursor_after_delete, entries_for_toasts,
+    fetch_health, health_check_due, health_needs_reconnect, load_message_log, plan_sync,
+    wipe_secret, without_known_ids,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -115,6 +116,7 @@ struct Live {
     stop: Option<watch::Sender<bool>>,
     resume_tx: watch::Sender<u64>,
     network_tx: watch::Sender<u64>,
+    health_tx: watch::Sender<u64>,
     events: UnboundedSender<SessionEvent>,
 }
 
@@ -134,6 +136,7 @@ async fn session_main(
     };
     let (resume_tx, _resume_rx) = watch::channel(0u64);
     let (network_tx, _network_rx) = watch::channel(0u64);
+    let (health_tx, _health_rx) = watch::channel(0u64);
     #[cfg(any(windows, target_os = "macos"))]
     {
         crate::power::listen_for_resume(resume_tx.clone());
@@ -147,6 +150,7 @@ async fn session_main(
         stop: None,
         resume_tx,
         network_tx,
+        health_tx,
         events,
     };
     if let Some(creds) = initial {
@@ -198,6 +202,9 @@ impl Live {
         let secret = Arc::clone(&self.secret);
         let resume = self.resume_tx.subscribe();
         let network = self.network_tx.subscribe();
+        let health = self.health_tx.subscribe();
+        let health_tx = self.health_tx.clone();
+        let (socket_tx, socket_rx) = watch::channel(LiveSocket::Down);
         tokio::spawn(async move {
             run_push(PushRun {
                 client,
@@ -207,9 +214,13 @@ impl Live {
                 stop: stop_rx,
                 resume,
                 network,
+                health,
+                health_tx,
+                socket: socket_rx,
                 events,
                 state,
                 secret,
+                socket_tx,
             })
             .await;
         });
@@ -362,9 +373,13 @@ struct PushRun {
     stop: watch::Receiver<bool>,
     resume: watch::Receiver<u64>,
     network: watch::Receiver<u64>,
+    health: watch::Receiver<u64>,
+    health_tx: watch::Sender<u64>,
+    socket: watch::Receiver<LiveSocket>,
     events: UnboundedSender<SessionEvent>,
     state: Arc<Mutex<LocalState>>,
     secret: Arc<Mutex<Option<String>>>,
+    socket_tx: watch::Sender<LiveSocket>,
 }
 
 async fn run_push(push: PushRun) {
@@ -376,9 +391,13 @@ async fn run_push(push: PushRun) {
         mut stop,
         resume,
         network,
+        health,
+        health_tx,
+        socket,
         events,
         state,
         secret,
+        socket_tx,
     } = push;
     if !still_current(&flag, epoch) {
         return;
@@ -438,10 +457,11 @@ async fn run_push(push: PushRun) {
 
     tracing::info!("connecting push websocket");
     let push = PushLoop::new(creds.device_id.clone(), creds.secret.clone());
-    let (_task, mut frames) = push.spawn(stop.clone(), resume, network);
+    let (_task, mut frames) = push.spawn(stop.clone(), resume, network, health, socket_tx);
     let mut nag = tokio::time::interval(EMERGENCY_REPEAT);
     nag.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     nag.tick().await;
+    let mut last_health = tokio::time::Instant::now();
 
     loop {
         if *stop.borrow() || !still_current(&flag, epoch) {
@@ -515,6 +535,8 @@ async fn run_push(push: PushRun) {
                         );
                         break;
                     }
+                    // A keepalive only marks the TCP read. It does not reset the
+                    // health interval and it does not count as a successful fetch.
                     Some(PushLoopEvent::KeepAlive | PushLoopEvent::Reload) => {}
                 }
             }
@@ -532,7 +554,68 @@ async fn run_push(push: PushRun) {
                     send(&events, SessionEvent::Notify { epoch, toast });
                 }
             }
+            _ = tokio::time::sleep_until(last_health + SESSION_HEALTH_EVERY), if still_current(&flag, epoch) => {
+                let since = last_health.elapsed();
+                if !health_check_due(true, since) {
+                    continue;
+                }
+                last_health = tokio::time::Instant::now();
+                let phase = *socket.borrow();
+                check_session_health(
+                    HealthCtx {
+                        client: &client,
+                        creds: &creds,
+                        state: &state,
+                        events: &events,
+                        epoch,
+                        flag: &flag,
+                        health_tx: &health_tx,
+                    },
+                    phase,
+                )
+                .await;
+            }
         }
+    }
+}
+
+struct HealthCtx<'a> {
+    client: &'a PushoverClient,
+    creds: &'a StoredCredentials,
+    state: &'a Mutex<LocalState>,
+    events: &'a UnboundedSender<SessionEvent>,
+    epoch: u64,
+    flag: &'a AtomicU64,
+    health_tx: &'a watch::Sender<u64>,
+}
+
+async fn check_session_health(ctx: HealthCtx<'_>, phase: LiveSocket) {
+    if !still_current(ctx.flag, ctx.epoch) {
+        return;
+    }
+    let socket = classify_socket(phase, std::time::Instant::now());
+    let fetch = if matches!(socket, SocketHealth::Connected) {
+        match sync_messages(
+            ctx.client, ctx.creds, ctx.state, ctx.events, false, ctx.epoch, ctx.flag,
+        )
+        .await
+        {
+            Ok(_) => Some(FetchHealth::Succeeded),
+            Err(err) => {
+                tracing::warn!("session health check failed: {err}");
+                Some(fetch_health(&err))
+            }
+        }
+    } else {
+        None
+    };
+    if !still_current(ctx.flag, ctx.epoch) {
+        return;
+    }
+    if health_needs_reconnect(socket, fetch) {
+        tracing::warn!("session health check is reconnecting");
+        let next = ctx.health_tx.borrow().wrapping_add(1);
+        let _ = ctx.health_tx.send(next);
     }
 }
 

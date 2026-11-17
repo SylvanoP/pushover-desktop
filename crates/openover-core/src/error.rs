@@ -62,4 +62,8 @@ pub enum WebSocketError {
     /// A network change (WLAN, cable, or VPN) hung the same read as sleep.
     #[error("network changed")]
     Network,
+    /// The session check found a down socket, a stuck connect, or a fetch
+    /// that did not succeed. Recover the same way as wake and network changes.
+    #[error("session health check failed")]
+    Unhealthy,
 }

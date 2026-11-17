@@ -4,6 +4,7 @@ mod api;
 mod credentials;
 mod device_name;
 mod error;
+mod health;
 mod local_state;
 mod message_log;
 mod password_mask;
@@ -18,6 +19,10 @@ pub use device_name::{
     DEFAULT_DEVICE_NAME, DeviceNameError, MAX_DEVICE_NAME_LEN, validate_device_name,
 };
 pub use error::{ApiError, CredentialError, WebSocketError};
+pub use health::{
+    CONNECT_STUCK_AFTER, FetchHealth, LiveSocket, SESSION_HEALTH_EVERY, SocketHealth,
+    classify_connecting, classify_socket, fetch_health, health_check_due, health_needs_reconnect,
+};
 pub use local_state::{LocalState, PendingEmergency, clamp_volume, default_state_path};
 pub use message_log::{
     LoggedMessage, append_message_log, clear_message_log, entries_for_toasts, load_message_log,

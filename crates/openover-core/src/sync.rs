@@ -3,6 +3,7 @@
 //! The Open Client API asks clients to drop a stale startup queue instead of
 //! notifying for every old message. After a cursor exists, only newer ids toast.
 
+use crate::health::message_id_is_new;
 use crate::sound::playback_code;
 use crate::types::Message;
 
@@ -241,7 +242,7 @@ fn strip_tags(input: &str) -> String {
 pub fn without_known_ids(toasts: Vec<Toast>, known: &[u64]) -> Vec<Toast> {
     toasts
         .into_iter()
-        .filter(|toast| !known.contains(&toast.message_id))
+        .filter(|toast| message_id_is_new(toast.message_id, known))
         .collect()
 }
 

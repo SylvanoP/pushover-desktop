@@ -1,4 +1,5 @@
 use crate::error::WebSocketError;
+use crate::health::{CONNECT_STUCK_AFTER, LiveSocket};
 use crate::types::{PUSHOVER_WS_ORIGIN, PUSHOVER_WS_URL, USER_AGENT};
 use futures_util::{SinkExt, Stream, StreamExt};
 use std::future::Future;
@@ -15,9 +16,10 @@ use tokio_tungstenite::{
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// No frame for this long means the socket is dead. Sleep usually drops TCP
-/// without a close, so a bare read would wait forever.
+/// without a close, so a bare read would wait forever. A keepalive frame
+/// restarts this timer. It is not a session health check.
 const PUSH_IDLE: Duration = Duration::from_secs(180);
-const CONNECT_LIMIT: Duration = Duration::from_secs(30);
+const CONNECT_LIMIT: Duration = CONNECT_STUCK_AFTER;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
@@ -69,11 +71,15 @@ impl PushLoop {
     /// `resume` increments when the machine leaves sleep.
     /// `network` increments when the link changes. That aborts the hung read
     /// the same way resume does.
+    /// `health` increments when the session check asks for the same recovery.
+    /// `socket` publishes whether the read loop is actually running.
     pub fn spawn(
         self,
         mut stop: watch::Receiver<bool>,
         mut resume: watch::Receiver<u64>,
         mut network: watch::Receiver<u64>,
+        mut health: watch::Receiver<u64>,
+        socket: watch::Sender<LiveSocket>,
     ) -> (
         tokio::task::JoinHandle<()>,
         mpsc::UnboundedReceiver<PushLoopEvent>,
@@ -84,18 +90,31 @@ impl PushLoop {
             let mut catch_up = false;
             loop {
                 if *stop.borrow() {
+                    let _ = socket.send(LiveSocket::Down);
                     break;
                 }
-                match self
-                    .run_session(&tx, &mut stop, &mut resume, &mut network, &mut catch_up)
-                    .await
-                {
-                    Ok(StopReason::Shutdown) | Ok(StopReason::Fatal) => break,
+                let outcome = {
+                    let mut signals = Signals {
+                        stop: &mut stop,
+                        resume: &mut resume,
+                        network: &mut network,
+                        health: &mut health,
+                    };
+                    self.run_session(&tx, &mut signals, &mut catch_up, &socket)
+                        .await
+                };
+                match outcome {
+                    Ok(StopReason::Shutdown) | Ok(StopReason::Fatal) => {
+                        let _ = socket.send(LiveSocket::Down);
+                        break;
+                    }
                     Ok(StopReason::Reload) => {
+                        let _ = socket.send(LiveSocket::Down);
                         backoff = Duration::from_secs(1);
                         catch_up = true;
                     }
                     Err(err) => {
+                        let _ = socket.send(LiveSocket::Down);
                         tracing::warn!("push websocket error: {err}");
                         let (plan, events) = begin_recovery(&err, &mut catch_up);
                         if !*stop.borrow() {
@@ -114,7 +133,7 @@ impl PushLoop {
                                     break;
                                 }
                             }
-                            link = link_changed(&mut resume, &mut network) => {
+                            link = link_changed(&mut resume, &mut network, &mut health) => {
                                 let Ok(signal) = link else {
                                     break;
                                 };
@@ -144,20 +163,21 @@ impl PushLoop {
     async fn run_session(
         &self,
         tx: &mpsc::UnboundedSender<PushLoopEvent>,
-        stop: &mut watch::Receiver<bool>,
-        resume: &mut watch::Receiver<u64>,
-        network: &mut watch::Receiver<u64>,
+        signals: &mut Signals<'_>,
         catch_up: &mut bool,
+        socket: &watch::Sender<LiveSocket>,
     ) -> Result<StopReason, WebSocketError> {
         loop {
-            if *stop.borrow() {
+            if *signals.stop.borrow() {
                 return Ok(StopReason::Shutdown);
             }
+            let _ = socket.send(LiveSocket::Connecting(std::time::Instant::now()));
             let request = push_request()?;
             let connected = race(
-                stop,
-                resume,
-                network,
+                signals.stop,
+                signals.resume,
+                signals.network,
+                signals.health,
                 tokio::time::timeout(CONNECT_LIMIT, connect_async(request)),
             )
             .await;
@@ -169,14 +189,15 @@ impl PushLoop {
                 Race::Ready(Ok(Err(err))) => return Err(WebSocketError::Connect(Box::new(err))),
                 Race::Ready(Err(_)) => return Err(WebSocketError::Stalled),
             };
-            if *stop.borrow() {
+            if *signals.stop.borrow() {
                 return Ok(StopReason::Shutdown);
             }
             let login = format!("login:{}:{}\n", self.device_id, self.secret);
             let sent = race(
-                stop,
-                resume,
-                network,
+                signals.stop,
+                signals.resume,
+                signals.network,
+                signals.health,
                 tokio::time::timeout(CONNECT_LIMIT, ws.send(Message::Text(login.into()))),
             )
             .await;
@@ -188,12 +209,29 @@ impl PushLoop {
                 Race::Ready(Ok(Err(err))) => return Err(WebSocketError::Dropped(Box::new(err))),
                 Race::Ready(Err(_)) => return Err(WebSocketError::Stalled),
             }
+            let _ = socket.send(LiveSocket::Connected);
             for event in session_opened(catch_up) {
                 let _ = tx.send(event);
             }
-            return read_frames(&mut ws, tx, stop, resume, network, PUSH_IDLE).await;
+            return read_frames(
+                &mut ws,
+                tx,
+                signals.stop,
+                signals.resume,
+                signals.network,
+                signals.health,
+                PUSH_IDLE,
+            )
+            .await;
         }
     }
+}
+
+struct Signals<'a> {
+    stop: &'a mut watch::Receiver<bool>,
+    resume: &'a mut watch::Receiver<u64>,
+    network: &'a mut watch::Receiver<u64>,
+    health: &'a mut watch::Receiver<u64>,
 }
 
 enum Race<T> {
@@ -207,12 +245,14 @@ enum Race<T> {
 enum LinkSignal {
     Resume,
     Network,
+    Health,
 }
 
 async fn race<T>(
     stop: &mut watch::Receiver<bool>,
     resume: &mut watch::Receiver<u64>,
     network: &mut watch::Receiver<u64>,
+    health: &mut watch::Receiver<u64>,
     fut: impl Future<Output = T>,
 ) -> Race<T> {
     tokio::pin!(fut);
@@ -225,7 +265,7 @@ async fn race<T>(
                 Race::Again
             }
         }
-        link = link_changed(resume, network) => match link {
+        link = link_changed(resume, network, health) => match link {
             Ok(signal) => Race::Link(signal),
             Err(()) => Race::Shutdown,
         },
@@ -236,6 +276,7 @@ async fn race<T>(
 async fn link_changed(
     resume: &mut watch::Receiver<u64>,
     network: &mut watch::Receiver<u64>,
+    health: &mut watch::Receiver<u64>,
 ) -> Result<LinkSignal, ()> {
     tokio::select! {
         biased;
@@ -253,6 +294,13 @@ async fn link_changed(
                 Ok(LinkSignal::Network)
             }
         }
+        changed = health.changed() => {
+            if changed.is_err() {
+                Err(())
+            } else {
+                Ok(LinkSignal::Health)
+            }
+        }
     }
 }
 
@@ -260,14 +308,15 @@ fn link_break(signal: LinkSignal) -> WebSocketError {
     match signal {
         LinkSignal::Resume => WebSocketError::Resume,
         LinkSignal::Network => WebSocketError::Network,
+        LinkSignal::Health => WebSocketError::Unhealthy,
     }
 }
 
-/// Sleep and a network change leave the same TCP read hung. Either signal
-/// aborts it, reconnects, and fetches messages missed while it was stuck.
+/// Sleep, a network change, and a failed session check leave the same TCP
+/// read hung. Each signal aborts it, reconnects, and fetches.
 fn recover_link(signal: LinkSignal) -> Recovery {
     match signal {
-        LinkSignal::Resume | LinkSignal::Network => Recovery {
+        LinkSignal::Resume | LinkSignal::Network | LinkSignal::Health => Recovery {
             reconnect: true,
             fetch: true,
         },
@@ -278,6 +327,7 @@ fn link_of(err: &WebSocketError) -> Option<LinkSignal> {
     match err {
         WebSocketError::Resume => Some(LinkSignal::Resume),
         WebSocketError::Network => Some(LinkSignal::Network),
+        WebSocketError::Unhealthy => Some(LinkSignal::Health),
         _ => None,
     }
 }
@@ -324,6 +374,7 @@ async fn read_frames<S>(
     stop: &mut watch::Receiver<bool>,
     resume: &mut watch::Receiver<u64>,
     network: &mut watch::Receiver<u64>,
+    health: &mut watch::Receiver<u64>,
     idle: Duration,
 ) -> Result<StopReason, WebSocketError>
 where
@@ -340,7 +391,7 @@ where
                     return Ok(StopReason::Shutdown);
                 }
             }
-            link = link_changed(resume, network) => {
+            link = link_changed(resume, network, health) => {
                 return match link {
                     Ok(signal) => Err(link_break(signal)),
                     Err(()) => Ok(StopReason::Shutdown),
@@ -442,11 +493,16 @@ mod tests {
             recover_link(LinkSignal::Network),
             recover_link(LinkSignal::Resume)
         );
+        assert_eq!(
+            recover_link(LinkSignal::Health),
+            recover_link(LinkSignal::Resume)
+        );
         let plan = recover_link(LinkSignal::Network);
         assert!(plan.reconnect);
         assert!(plan.fetch);
         assert_eq!(plan_recovery(&link_break(LinkSignal::Network)), plan);
         assert_eq!(plan_recovery(&link_break(LinkSignal::Resume)), plan);
+        assert_eq!(plan_recovery(&link_break(LinkSignal::Health)), plan);
     }
 
     #[test]
@@ -483,6 +539,7 @@ mod tests {
         let (_stop_tx, mut stop) = watch::channel(false);
         let (_resume_tx, mut resume) = watch::channel(0u64);
         let (_network_tx, mut network) = watch::channel(0u64);
+        let (_health_tx, mut health) = watch::channel(0u64);
         let mut ws = futures_util::stream::pending::<
             Result<Message, tokio_tungstenite::tungstenite::Error>,
         >();
@@ -494,6 +551,7 @@ mod tests {
                 &mut stop,
                 &mut resume,
                 &mut network,
+                &mut health,
                 Duration::from_millis(30),
             ),
         )
@@ -516,6 +574,7 @@ mod tests {
         let (_stop_tx, mut stop) = watch::channel(false);
         let (resume_tx, mut resume) = watch::channel(0u64);
         let (_network_tx, mut network) = watch::channel(0u64);
+        let (_health_tx, mut health) = watch::channel(0u64);
         resume_tx.send(1).expect("resume signal");
         let mut ws = futures_util::stream::pending::<
             Result<Message, tokio_tungstenite::tungstenite::Error>,
@@ -528,6 +587,7 @@ mod tests {
                 &mut stop,
                 &mut resume,
                 &mut network,
+                &mut health,
                 Duration::from_secs(300),
             ),
         )
@@ -550,6 +610,7 @@ mod tests {
         let (_stop_tx, mut stop) = watch::channel(false);
         let (_resume_tx, mut resume) = watch::channel(0u64);
         let (network_tx, mut network) = watch::channel(0u64);
+        let (_health_tx, mut health) = watch::channel(0u64);
         network_tx.send(1).expect("network signal");
         let mut ws = futures_util::stream::pending::<
             Result<Message, tokio_tungstenite::tungstenite::Error>,
@@ -562,6 +623,7 @@ mod tests {
                 &mut stop,
                 &mut resume,
                 &mut network,
+                &mut health,
                 Duration::from_secs(300),
             ),
         )
@@ -569,6 +631,45 @@ mod tests {
         .expect("network change ends a stalled read")
         .expect_err("network");
         assert!(matches!(end, WebSocketError::Network));
+        let (plan, events) = recover(&end);
+        let (resume_plan, resume_events) = recover(&WebSocketError::Resume);
+        assert_eq!(plan, resume_plan);
+        assert_eq!(events, resume_events);
+        assert!(plan.reconnect);
+        assert!(plan.fetch);
+        assert_eq!(
+            events,
+            vec![PushLoopEvent::Disconnected, PushLoopEvent::Sync]
+        );
+    }
+
+    #[tokio::test]
+    async fn health_signal_reconnects_and_fetches() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (_stop_tx, mut stop) = watch::channel(false);
+        let (_resume_tx, mut resume) = watch::channel(0u64);
+        let (_network_tx, mut network) = watch::channel(0u64);
+        let (health_tx, mut health) = watch::channel(0u64);
+        health_tx.send(1).expect("health signal");
+        let mut ws = futures_util::stream::pending::<
+            Result<Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+        let end = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_frames(
+                &mut ws,
+                &tx,
+                &mut stop,
+                &mut resume,
+                &mut network,
+                &mut health,
+                Duration::from_secs(300),
+            ),
+        )
+        .await
+        .expect("health check ends a stalled read")
+        .expect_err("health");
+        assert!(matches!(end, WebSocketError::Unhealthy));
         let (plan, events) = recover(&end);
         let (resume_plan, resume_events) = recover(&WebSocketError::Resume);
         assert_eq!(plan, resume_plan);
