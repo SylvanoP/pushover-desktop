@@ -27,7 +27,13 @@ pub struct LoggedMessage {
     pub sound: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Pushover's label for `url`. Shown instead of the raw address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_title: Option<String>,
 }
+
+/// Rows the log keeps. Older rows drop out so the file stays small.
+pub const MESSAGE_LOG_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct MessageFile {
@@ -77,6 +83,27 @@ impl MessageLog {
                 self.messages.push(entry.clone());
             }
         }
+        self.trim_to_limit();
+    }
+
+    /// Keeps the newest `MESSAGE_LOG_LIMIT` rows, dropping the oldest ones.
+    fn trim_to_limit(&mut self) {
+        if self.messages.len() <= MESSAGE_LOG_LIMIT {
+            return;
+        }
+        let keep: std::collections::HashSet<u64> = self
+            .newest()
+            .into_iter()
+            .take(MESSAGE_LOG_LIMIT)
+            .map(|item| item.id)
+            .collect();
+        self.messages.retain(|item| keep.contains(&item.id));
+    }
+
+    pub fn forget(&mut self, id: u64) -> bool {
+        let before = self.messages.len();
+        self.messages.retain(|item| item.id != id);
+        before != self.messages.len()
     }
 
     pub fn newest(&self) -> Vec<LoggedMessage> {
@@ -125,10 +152,30 @@ pub fn append_message_log(entries: &[LoggedMessage]) {
     }
 }
 
-pub fn clear_message_log() {
+/// Removes one row. The file is rewritten, or deleted when nothing is left.
+pub fn forget_message(id: u64) {
     let _guard = log_lock();
     let path = messages_path();
-    if let Err(err) = std::fs::remove_file(&path)
+    let mut log = MessageLog::read(&path);
+    if !log.forget(id) {
+        return;
+    }
+    if log.messages.is_empty() {
+        remove_log_file(&path);
+        return;
+    }
+    if let Err(err) = log.write(&path) {
+        tracing::warn!("could not store message log: {err}");
+    }
+}
+
+pub fn clear_message_log() {
+    let _guard = log_lock();
+    remove_log_file(&messages_path());
+}
+
+fn remove_log_file(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path)
         && err.kind() != std::io::ErrorKind::NotFound
     {
         tracing::warn!("could not delete message log: {err}");
@@ -142,6 +189,14 @@ fn logged_message(message: &Message, toast: &Toast, now: u64) -> LoggedMessage {
         .map(str::trim)
         .filter(|url| !url.is_empty())
         .map(str::to_string);
+    let url_title = url.as_ref().and_then(|_| {
+        message
+            .url_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_string)
+    });
     LoggedMessage {
         id: message.id,
         time: message.date.filter(|time| *time > 0).unwrap_or(now),
@@ -151,6 +206,7 @@ fn logged_message(message: &Message, toast: &Toast, now: u64) -> LoggedMessage {
         priority: message.priority,
         sound: sound_name(message),
         url,
+        url_title,
     }
 }
 
@@ -270,6 +326,7 @@ mod tests {
             priority: 0,
             sound: Some("pushover".into()),
             url: None,
+            url_title: None,
         };
         log.remember(std::slice::from_ref(&older));
         log.write(&path).unwrap();
@@ -284,6 +341,66 @@ mod tests {
         );
         std::fs::remove_file(&path).unwrap();
         assert!(MessageLog::read(&path).messages.is_empty());
+    }
+
+    #[test]
+    fn the_log_keeps_only_the_newest_rows() {
+        let mut log = MessageLog::default();
+        let entries: Vec<_> = (1..=MESSAGE_LOG_LIMIT as u64 + 20)
+            .map(|id| LoggedMessage {
+                id,
+                time: id,
+                app: "Demo".into(),
+                title: format!("T{id}"),
+                text: String::new(),
+                priority: 0,
+                sound: None,
+                url: None,
+                url_title: None,
+            })
+            .collect();
+        log.remember(&entries);
+        let kept = log.newest();
+        assert_eq!(kept.len(), MESSAGE_LOG_LIMIT);
+        assert_eq!(kept[0].id, MESSAGE_LOG_LIMIT as u64 + 20);
+        assert_eq!(kept[MESSAGE_LOG_LIMIT - 1].id, 21);
+    }
+
+    #[test]
+    fn forgetting_a_row_leaves_the_others() {
+        let mut log = MessageLog::default();
+        let message = message(7, 0);
+        let plan = plan_sync(std::slice::from_ref(&message), Some(6), None, None, false);
+        log.remember(&entries_for_toasts(
+            std::slice::from_ref(&message),
+            &plan.toasts,
+            1,
+        ));
+        assert!(log.forget(7));
+        assert!(log.messages.is_empty());
+        assert!(!log.forget(7));
+    }
+
+    #[test]
+    fn the_link_label_is_kept_only_with_a_link() {
+        let mut with_link = message(2, 0);
+        with_link.url = Some("https://example.com".into());
+        with_link.url_title = Some(" Rechnung ".into());
+        let plan = plan_sync(std::slice::from_ref(&with_link), Some(1), None, None, false);
+        let entries = entries_for_toasts(std::slice::from_ref(&with_link), &plan.toasts, 1);
+        assert_eq!(entries[0].url_title.as_deref(), Some("Rechnung"));
+
+        let mut label_only = message(3, 0);
+        label_only.url_title = Some("Rechnung".into());
+        let plan = plan_sync(
+            std::slice::from_ref(&label_only),
+            Some(2),
+            None,
+            None,
+            false,
+        );
+        let entries = entries_for_toasts(std::slice::from_ref(&label_only), &plan.toasts, 1);
+        assert_eq!(entries[0].url_title, None);
     }
 
     #[test]

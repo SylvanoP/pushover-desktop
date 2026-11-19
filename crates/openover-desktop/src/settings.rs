@@ -7,11 +7,11 @@ use crate::unread::{DotEvent, UnreadDot, unread_dot};
 
 use futures_util::StreamExt as _;
 use gpui::{
-    Animation, AnimationExt, App, Bounds, Context, DispatchPhase, Entity, Focusable, Global,
-    Hitbox, KeyDownEvent, MouseButton, MouseMoveEvent, Pixels, Point, SharedString, Subscription,
-    SystemNotification, SystemNotificationAction, TitlebarOptions, Window, WindowBounds,
-    WindowHandle, WindowOptions, div, prelude::*, pulsating_between, px, relative, rgb_to_hsla,
-    size,
+    Animation, AnimationExt, App, Bounds, ClipboardItem, Context, DispatchPhase, Entity, Focusable,
+    Global, Hitbox, KeyDownEvent, MouseButton, MouseMoveEvent, Pixels, Point, SharedString,
+    Subscription, SystemNotification, SystemNotificationAction, TitlebarOptions, Window,
+    WindowBounds, WindowHandle, WindowOptions, div, prelude::*, pulsating_between, px, relative,
+    rgb_to_hsla, size,
 };
 use gpui_ce_elements::editable_text::{
     EditableTextState, StringStorage, TextChanged,
@@ -19,8 +19,8 @@ use gpui_ce_elements::editable_text::{
     text_input,
 };
 use openover_core::{
-    CredentialStore, DEFAULT_DEVICE_NAME, LocalState, LoggedMessage, Toast, clamp_volume,
-    validate_device_name,
+    CredentialStore, DEFAULT_DEVICE_NAME, LocalState, LoggedMessage, MAX_DIGEST_THRESHOLD, Toast,
+    clamp_digest_threshold, clamp_volume, validate_device_name,
 };
 
 struct SettingsState(Entity<Settings>);
@@ -64,9 +64,11 @@ pub struct Settings {
     connection: Connection,
     sound_enabled: bool,
     sound_volume: u8,
+    digest_threshold: u8,
     dragging_volume: bool,
     volume_bounds: Option<Bounds<Pixels>>,
     messages: Vec<LoggedMessage>,
+    search: Entity<EditableTextState>,
     confirm_clear: bool,
     selected_id: Option<u64>,
     epoch: u64,
@@ -90,6 +92,7 @@ impl Settings {
         let password = cx.new(MaskedPassword::new);
         let twofa = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let device_name = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
+        let search = cx.new(|cx| EditableTextState::new(StringStorage::default(), cx));
         let stored = LocalState::load();
         let stored_name = stored
             .device_name
@@ -101,6 +104,7 @@ impl Settings {
             cx.subscribe(&device_name, |_, _, _: &TextChanged, cx| cx.notify()),
             cx.subscribe(&email, |_, _, _: &TextChanged, cx| cx.notify()),
             cx.subscribe(&twofa, |_, _, _: &TextChanged, cx| cx.notify()),
+            cx.subscribe(&search, |_, _, _: &TextChanged, cx| cx.notify()),
         ];
         let messages = openover_core::load_message_log();
         let unread = UnreadDot::at_start(false, messages.iter().map(|message| message.id));
@@ -117,9 +121,11 @@ impl Settings {
             connection: Connection::SignedOut,
             sound_enabled: stored.sound_enabled,
             sound_volume: clamp_volume(stored.sound_volume),
+            digest_threshold: clamp_digest_threshold(stored.digest_threshold),
             dragging_volume: false,
             volume_bounds: None,
             messages,
+            search,
             confirm_clear: false,
             selected_id: None,
             epoch: 0,
@@ -218,6 +224,35 @@ impl Settings {
         }
     }
 
+    fn step_digest_threshold(&mut self, delta: i16, cx: &mut Context<Self>) {
+        let next = (i16::from(self.digest_threshold) + delta)
+            .clamp(0, i16::from(MAX_DIGEST_THRESHOLD)) as u8;
+        if next == self.digest_threshold {
+            return;
+        }
+        self.digest_threshold = next;
+        self.persist_digest(cx);
+        cx.notify();
+    }
+
+    fn persist_digest(&self, cx: &mut Context<Self>) {
+        let threshold = self.digest_threshold;
+        let sent = cx.try_global::<SessionCommands>().is_some_and(|commands| {
+            commands
+                .0
+                .send(SessionCommand::SetDigestThreshold { threshold })
+                .is_ok()
+        });
+        if sent {
+            return;
+        }
+        let mut state = LocalState::load();
+        state.digest_threshold = threshold;
+        if let Err(err) = state.save() {
+            tracing::warn!("could not store digest setting: {err}");
+        }
+    }
+
     fn apply_volume_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let Some(bounds) = self.volume_bounds else {
             return;
@@ -250,6 +285,15 @@ impl Settings {
         self.messages.clear();
         self.selected_id = None;
         self.confirm_clear = false;
+        cx.notify();
+    }
+
+    fn forget_message(&mut self, id: u64, cx: &mut Context<Self>) {
+        openover_core::forget_message(id);
+        self.messages.retain(|message| message.id != id);
+        if self.selected_id == Some(id) {
+            self.selected_id = None;
+        }
         cx.notify();
     }
 
@@ -324,6 +368,17 @@ impl Settings {
                 if let Some(receipt) = toast.receipt.clone() {
                     self.pending_emergency = Some((receipt, toast.title.clone()));
                 }
+            }
+            SessionEvent::NotifyDigest { epoch, toasts } => {
+                if !self.accept_epoch(epoch) {
+                    return false;
+                }
+                for toast in &toasts {
+                    self.note_dot(DotEvent::Message(toast.message_id), cx);
+                }
+                show_digest(cx, &toasts, self.sound_enabled, self.sound_volume);
+                self.reload_messages();
+                self.status = format!("{} neue Nachrichten.", toasts.len()).into();
             }
             SessionEvent::EmergencyAcknowledged { receipt } => {
                 if self
@@ -489,6 +544,7 @@ impl Render for Settings {
             .read(cx)
             .focus_handle(cx)
             .is_focused(window);
+        let search_focused = self.search.read(cx).focus_handle(cx).is_focused(window);
         let device_name = self.device_name.read(cx).as_str().trim().to_string();
         let email = self.email.read(cx).as_str().trim().to_string();
         let name_error = validate_device_name(&device_name)
@@ -545,7 +601,7 @@ impl Render for Settings {
                             cx,
                         ),
                         Pane::Preferences => preferences_pane(self, &theme, &device_name, cx),
-                        Pane::Messages => messages_pane(self, &theme, cx),
+                        Pane::Messages => messages_pane(self, &theme, search_focused, cx),
                     })
                     .when_some(self.pending_emergency.clone(), |form, (_, title)| {
                         form.child(emergency_card(title, &theme, cx))
@@ -687,6 +743,7 @@ fn preferences_pane(
                 )
                 .child(div().flex_1().child(volume_slider(settings, theme, cx))),
         )
+        .child(digest_row(settings, theme, cx))
         .child(labeled(
             "Gerätename",
             field_chrome(div(), theme, false).child(shown_name),
@@ -841,6 +898,99 @@ fn autostart_row(
         })
 }
 
+/// Stepper for the batch size from which a summary replaces single toasts.
+fn digest_row(
+    settings: &Settings,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> impl IntoElement {
+    let threshold = settings.digest_threshold;
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .child(
+            field_chrome(div(), theme, false)
+                .justify_between()
+                .gap(px(12.))
+                .child("Sammelmeldung ab")
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .child(stepper_button(
+                            "digest-less",
+                            "−",
+                            threshold > 0,
+                            theme,
+                            cx.listener(|this, _, _, cx| this.step_digest_threshold(-1, cx)),
+                        ))
+                        .child(
+                            div()
+                                .w(px(64.))
+                                .flex()
+                                .justify_center()
+                                .text_color(if threshold == 0 {
+                                    theme.quiet
+                                } else {
+                                    theme.accent
+                                })
+                                .child(if threshold == 0 {
+                                    "Aus".to_string()
+                                } else {
+                                    threshold.to_string()
+                                }),
+                        )
+                        .child(stepper_button(
+                            "digest-more",
+                            "+",
+                            threshold < MAX_DIGEST_THRESHOLD,
+                            theme,
+                            cx.listener(|this, _, _, cx| this.step_digest_threshold(1, cx)),
+                        )),
+                ),
+        )
+        .child(div().text_xs().text_color(theme.quiet).child(
+            if threshold == 0 {
+                "Jede Nachricht kommt als eigene Meldung.".to_string()
+            } else {
+                format!(
+                    "Ab {threshold} Nachrichten auf einmal kommt eine Sammelmeldung statt einzelner. Notfälle immer einzeln."
+                )
+            },
+        ))
+}
+
+fn stepper_button(
+    id: &'static str,
+    label: &'static str,
+    enabled: bool,
+    theme: &FormTheme,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let button = div()
+        .id(id)
+        .size(px(24.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .text_color(if enabled {
+            theme.text
+        } else {
+            theme.placeholder
+        })
+        .child(label);
+    if enabled {
+        button.cursor_pointer().on_click(on_click)
+    } else {
+        button
+    }
+}
+
 fn volume_slider(
     settings: &Settings,
     theme: &FormTheme,
@@ -914,28 +1064,52 @@ fn volume_slider(
         )
 }
 
-fn messages_pane(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settings>) -> gpui::Div {
+fn messages_pane(
+    settings: &Settings,
+    theme: &FormTheme,
+    search_focused: bool,
+    cx: &mut Context<Settings>,
+) -> gpui::Div {
     if settings.messages.is_empty() {
         return div()
             .text_color(theme.quiet)
             .child("Noch keine Nachrichten.");
     }
-    let messages = newest_first(&settings.messages);
+    let query = settings.search.read(cx).as_str().to_string();
+    let messages = matching(&newest_first(&settings.messages), &query);
+    let head = div()
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .child(div().flex_1().child(text_field(
+            "message-search",
+            settings.search.downgrade(),
+            "Suchen",
+            theme,
+            search_focused,
+        )))
+        .child(clear_control(settings.confirm_clear, theme, cx));
+
+    if messages.is_empty() {
+        return div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(head)
+            .child(div().text_color(theme.quiet).child("Kein Treffer."));
+    }
+
     let mut list = div().id("message-list").flex().flex_col();
     for message in &messages {
         list = list.child(message_row(
             message,
             settings.selected_id == Some(message.id),
+            settings.unread.is_fresh(message.id),
             theme,
             cx,
         ));
     }
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(8.))
-        .child(clear_control(settings.confirm_clear, theme, cx))
-        .child(list)
+    div().flex().flex_col().gap(px(8.)).child(head).child(list)
 }
 
 fn newest_first(messages: &[LoggedMessage]) -> Vec<LoggedMessage> {
@@ -944,90 +1118,198 @@ fn newest_first(messages: &[LoggedMessage]) -> Vec<LoggedMessage> {
     items
 }
 
+/// Case-insensitive substring over app, title, and text. An empty query keeps everything.
+fn matching(messages: &[LoggedMessage], query: &str) -> Vec<LoggedMessage> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return messages.to_vec();
+    }
+    messages
+        .iter()
+        .filter(|message| {
+            message.app.to_lowercase().contains(&needle)
+                || message.title.to_lowercase().contains(&needle)
+                || message.text.to_lowercase().contains(&needle)
+        })
+        .cloned()
+        .collect()
+}
+
 fn message_row(
     message: &LoggedMessage,
     selected: bool,
+    fresh: bool,
     theme: &FormTheme,
     cx: &mut Context<Settings>,
 ) -> gpui::Div {
     let id = message.id;
     let url = message.url.clone();
+    let link_label = message
+        .url_title
+        .clone()
+        .or_else(|| url.clone())
+        .unwrap_or_default();
     div()
         .flex()
-        .flex_col()
-        .gap(px(6.))
+        .gap(px(10.))
         .py(px(8.))
         .border_b_1()
         .border_color(theme.border)
+        .child(priority_stripe(message.priority, theme))
         .child(
             div()
-                .id(SharedString::from(format!("msg-{id}")))
+                .flex_1()
+                .min_w_0()
                 .flex()
-                .items_center()
-                .gap(px(12.))
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.selected_id = if this.selected_id == Some(id) {
-                        None
-                    } else {
-                        Some(id)
-                    };
-                    cx.notify();
-                }))
+                .flex_col()
+                .gap(px(6.))
                 .child(
                     div()
-                        .w(px(96.))
-                        .flex_shrink_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_color(theme.quiet)
-                        .child(message.app.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_color(if selected { theme.accent } else { theme.text })
-                        .child(message.title.clone()),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_color(theme.quiet)
-                        .whitespace_nowrap()
-                        .child(format_local_time(message.time)),
-                ),
-        )
-        .when(selected, |row| {
-            let body = message_body(message);
-            row.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .whitespace_normal()
-                    .when(!body.is_empty(), |block| block.child(div().child(body)))
-                    .when_some(url, |block, url| {
-                        block.child(
+                        .id(SharedString::from(format!("msg-{id}")))
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.selected_id = if this.selected_id == Some(id) {
+                                None
+                            } else {
+                                Some(id)
+                            };
+                            cx.notify();
+                        }))
+                        .child(
                             div()
-                                .id("message-url")
-                                .cursor_pointer()
-                                .underline()
-                                .text_color(theme.accent)
+                                .w(px(96.))
+                                .flex_shrink_0()
                                 .overflow_hidden()
-                                .child(url.clone())
-                                .on_click(move |_, _, cx| {
-                                    cx.open_url(&url);
-                                }),
+                                .whitespace_nowrap()
+                                .text_color(theme.quiet)
+                                .child(message.app.clone()),
                         )
-                    }),
-            )
-        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .when(fresh, |title| title.font_weight(gpui::FontWeight::SEMIBOLD))
+                                .text_color(if selected { theme.accent } else { theme.text })
+                                .child(message.title.clone()),
+                        )
+                        .when(fresh, |row| {
+                            row.child(
+                                div()
+                                    .size(px(6.))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .bg(theme.accent),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_color(theme.quiet)
+                                .whitespace_nowrap()
+                                .child(format_local_time(message.time)),
+                        ),
+                )
+                .when(selected, |row| {
+                    let body = message_body(message);
+                    let clip = copy_text(message);
+                    row.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .whitespace_normal()
+                            .when(!body.is_empty(), |block| block.child(div().child(body)))
+                            .when_some(url, |block, url| {
+                                block.child(
+                                    div()
+                                        .id("message-url")
+                                        .cursor_pointer()
+                                        .underline()
+                                        .text_color(theme.accent)
+                                        .overflow_hidden()
+                                        .child(link_label)
+                                        .on_click(move |_, _, cx| {
+                                            cx.open_url(&url);
+                                        }),
+                                )
+                            })
+                            .child(row_actions(id, clip, theme, cx)),
+                    )
+                }),
+        )
+}
+
+/// Left edge of a row. Emergencies shout, low priority stays quiet.
+fn priority_stripe(priority: i32, theme: &FormTheme) -> gpui::Div {
+    let color = match priority {
+        2 => theme.stopped,
+        1 => theme.pending,
+        0 => theme.border,
+        _ => theme.field,
+    };
+    div().w(px(3.)).flex_shrink_0().rounded_md().bg(color)
+}
+
+fn row_actions(id: u64, clip: String, theme: &FormTheme, cx: &mut Context<Settings>) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(16.))
+        .child(copy_control(id, clip, theme, cx))
+        .child(
+            div()
+                .id(SharedString::from(format!("forget-{id}")))
+                .cursor_pointer()
+                .text_xs()
+                .text_color(theme.quiet)
+                .child("Löschen")
+                .on_click(cx.listener(move |this, _, _, cx| this.forget_message(id, cx))),
+        )
 }
 
 fn message_body(message: &LoggedMessage) -> String {
     message.text.clone()
+}
+
+/// What the clipboard gets: title, text, and the link, each on its own line.
+fn copy_text(message: &LoggedMessage) -> String {
+    let mut lines = Vec::new();
+    if !message.title.trim().is_empty() {
+        lines.push(message.title.clone());
+    }
+    if !message.text.trim().is_empty() {
+        lines.push(message.text.clone());
+    }
+    if let Some(url) = &message.url {
+        match &message.url_title {
+            Some(title) => lines.push(format!("{title}: {url}")),
+            None => lines.push(url.clone()),
+        }
+    }
+    lines.join("\n")
+}
+
+fn copy_control(id: u64, text: String, theme: &FormTheme, cx: &mut Context<Settings>) -> gpui::Div {
+    if text.is_empty() {
+        return div();
+    }
+    div().child(
+        div()
+            .id(SharedString::from(format!("copy-{id}")))
+            .cursor_pointer()
+            .text_xs()
+            .text_color(theme.accent)
+            .child("Kopieren")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                this.set_status("In die Zwischenablage kopiert.", cx);
+            })),
+    )
 }
 
 fn emergency_card(
@@ -1291,6 +1573,30 @@ fn show_toast(cx: &mut App, toast: &Toast, sound_enabled: bool, sound_volume: u8
             actions,
         },
         Some(toast.message_id.to_string()),
+    );
+}
+
+/// One notification for a whole batch. Clicking it opens the list at the newest row.
+fn show_digest(cx: &mut App, toasts: &[Toast], sound_enabled: bool, sound_volume: u8) {
+    let Some(newest) = toasts.iter().max_by_key(|toast| toast.message_id) else {
+        return;
+    };
+    if sound_enabled
+        && sound_volume > 0
+        && let Some(path) = toasts.iter().find_map(|toast| toast.sound_path.clone())
+    {
+        crate::sound::play(path, sound_volume);
+    }
+    let (title, body) = openover_core::digest_summary(toasts);
+    crate::notify::present(
+        cx,
+        SystemNotification {
+            tag: "openover-digest".into(),
+            title: title.into(),
+            body: body.into(),
+            actions: vec![],
+        },
+        Some(newest.message_id.to_string()),
     );
 }
 
@@ -1574,8 +1880,68 @@ fn windows_local_time(unix: u64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use openover_core::LoggedMessage;
+
+    fn logged(title: &str, text: &str, url: Option<&str>) -> LoggedMessage {
+        LoggedMessage {
+            id: 1,
+            time: 0,
+            app: "App".into(),
+            title: title.into(),
+            text: text.into(),
+            priority: 0,
+            sound: None,
+            url: url.map(str::to_string),
+            url_title: None,
+        }
+    }
+
     #[test]
     fn closing_the_window_does_not_quit() {
         assert!(!super::allow_window_close());
+    }
+
+    #[test]
+    fn copy_text_joins_title_body_and_link() {
+        let message = logged("Titel", "Text", Some("https://example.com"));
+        assert_eq!(
+            super::copy_text(&message),
+            "Titel\nText\nhttps://example.com"
+        );
+    }
+
+    #[test]
+    fn copy_text_skips_empty_parts() {
+        assert_eq!(super::copy_text(&logged("  ", "Text", None)), "Text");
+        assert_eq!(super::copy_text(&logged("", "", None)), "");
+    }
+
+    #[test]
+    fn copy_text_names_the_link_when_pushover_labels_it() {
+        let mut message = logged("Titel", "", Some("https://example.com"));
+        message.url_title = Some("Rechnung".into());
+        assert_eq!(
+            super::copy_text(&message),
+            "Titel\nRechnung: https://example.com"
+        );
+    }
+
+    #[test]
+    fn an_empty_query_keeps_every_row() {
+        let rows = vec![logged("A", "eins", None), logged("B", "zwei", None)];
+        assert_eq!(super::matching(&rows, "   ").len(), 2);
+    }
+
+    #[test]
+    fn the_query_matches_app_title_and_text_ignoring_case() {
+        let mut app_row = logged("Titel", "Text", None);
+        app_row.id = 2;
+        app_row.app = "Grafana".into();
+        let rows = vec![logged("Backup fertig", "ohne Fehler", None), app_row];
+
+        assert_eq!(super::matching(&rows, "BACKUP").len(), 1);
+        assert_eq!(super::matching(&rows, "fehler")[0].id, 1);
+        assert_eq!(super::matching(&rows, "grafana")[0].id, 2);
+        assert!(super::matching(&rows, "nichts").is_empty());
     }
 }

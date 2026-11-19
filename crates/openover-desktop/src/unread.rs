@@ -5,11 +5,15 @@ use std::collections::HashSet;
 /// Ids already in the log when this is created never raise it. A message
 /// while the window is visible does not raise it. Hiding the window leaves
 /// the latch as it was.
+///
+/// Alongside the latch it tracks which rows arrived unseen, so the list can
+/// mark them. Revealing the window clears those marks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadDot {
     window_visible: bool,
     pending: bool,
     known: HashSet<u64>,
+    fresh: HashSet<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,11 +29,17 @@ impl UnreadDot {
             window_visible,
             pending: false,
             known: already_logged.into_iter().collect(),
+            fresh: HashSet::new(),
         }
     }
 
     pub const fn shows(&self) -> bool {
         self.pending
+    }
+
+    /// True while the row arrived unseen and the window has not been opened since.
+    pub fn is_fresh(&self, id: u64) -> bool {
+        self.fresh.contains(&id)
     }
 }
 
@@ -39,6 +49,7 @@ pub fn unread_dot(mut state: UnreadDot, event: DotEvent) -> UnreadDot {
             let fresh = state.known.insert(id);
             if fresh && !state.window_visible {
                 state.pending = true;
+                state.fresh.insert(id);
             }
             state
         }
@@ -46,11 +57,13 @@ pub fn unread_dot(mut state: UnreadDot, event: DotEvent) -> UnreadDot {
             window_visible: true,
             pending: false,
             known: state.known,
+            fresh: HashSet::new(),
         },
         DotEvent::Hidden => UnreadDot {
             window_visible: false,
             pending: state.pending,
             known: state.known,
+            fresh: state.fresh,
         },
     }
 }
@@ -104,6 +117,22 @@ mod tests {
         let dot = unread_dot(UnreadDot::at_start(false, []), DotEvent::Message(1));
         let dot = unread_dot(dot, DotEvent::Message(2));
         assert!(dot.shows());
+    }
+
+    #[test]
+    fn a_row_is_fresh_until_the_window_opens() {
+        let dot = unread_dot(UnreadDot::at_start(false, [1]), DotEvent::Message(2));
+        assert!(dot.is_fresh(2));
+        assert!(!dot.is_fresh(1));
+        let dot = unread_dot(dot, DotEvent::Hidden);
+        assert!(dot.is_fresh(2));
+        assert!(!unread_dot(dot, DotEvent::Revealed).is_fresh(2));
+    }
+
+    #[test]
+    fn a_row_arriving_while_visible_is_not_fresh() {
+        let dot = unread_dot(UnreadDot::at_start(true, []), DotEvent::Message(1));
+        assert!(!dot.is_fresh(1));
     }
 
     #[test]

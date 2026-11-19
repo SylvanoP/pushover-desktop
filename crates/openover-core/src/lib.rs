@@ -25,15 +25,17 @@ pub use health::{
 };
 pub use local_state::{LocalState, PendingEmergency, clamp_volume, default_state_path};
 pub use message_log::{
-    LoggedMessage, append_message_log, clear_message_log, entries_for_toasts, load_message_log,
-    messages_path,
+    LoggedMessage, MESSAGE_LOG_LIMIT, append_message_log, clear_message_log, entries_for_toasts,
+    forget_message, load_message_log, messages_path,
 };
 pub use password_mask::{
     MAX_PASSWORD_CHARS, PASSWORD_BULLET, apply_masked_replace, mask_password, wipe_secret,
 };
 pub use sound::{playback_code, sanitize_sound_code, sound_cache_dir};
 pub use sync::{
-    STALE_BACKLOG_LIMIT, SyncPlan, Toast, cursor_after_delete, plan_sync, without_known_ids,
+    DEFAULT_DIGEST_THRESHOLD, Delivery, MAX_DIGEST_THRESHOLD, STALE_BACKLOG_LIMIT, SyncPlan, Toast,
+    clamp_digest_threshold, cursor_after_delete, digest_summary, plan_sync, split_for_delivery,
+    without_known_ids,
 };
 pub use types::{
     API_BASE, DeviceRegistration, LoginResult, Message, MessagesResponse, OpenClientOs,

@@ -40,6 +40,14 @@ pub struct LocalState {
     /// Wish for the Windows Run key. A missing key stays off.
     #[serde(default)]
     pub start_with_windows: bool,
+    /// Messages in one batch from which on they arrive as a single summary.
+    /// 0 turns bundling off. Missing keys take the default.
+    #[serde(default = "digest_threshold_by_default")]
+    pub digest_threshold: u8,
+}
+
+fn digest_threshold_by_default() -> u8 {
+    crate::sync::DEFAULT_DIGEST_THRESHOLD
 }
 
 fn sound_enabled_by_default() -> bool {
@@ -65,6 +73,7 @@ impl Default for LocalState {
             sound_enabled: true,
             sound_volume: 100,
             start_with_windows: false,
+            digest_threshold: crate::sync::DEFAULT_DIGEST_THRESHOLD,
         }
     }
 }
@@ -178,6 +187,7 @@ mod tests {
             sound_enabled: true,
             sound_volume: 40,
             start_with_windows: true,
+            digest_threshold: 5,
         };
         state.write(&path).unwrap();
         let loaded = LocalState::read(&path).unwrap();
@@ -191,6 +201,10 @@ mod tests {
         assert!(state.sound_enabled);
         assert_eq!(state.sound_volume, 100);
         assert!(!state.start_with_windows);
+        assert_eq!(
+            state.digest_threshold,
+            crate::sync::DEFAULT_DIGEST_THRESHOLD
+        );
         assert_eq!(super::clamp_volume(140), 100);
         assert_eq!(super::clamp_volume(0), 0);
     }
