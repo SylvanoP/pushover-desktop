@@ -6,9 +6,9 @@ use futures_channel::mpsc::UnboundedSender;
 use openover_core::{
     ApiError, CredentialStore, FetchHealth, LiveSocket, LocalState, PendingEmergency, PushLoop,
     PushLoopEvent, PushoverClient, SESSION_HEALTH_EVERY, SocketHealth, StoredCredentials, Toast,
-    append_message_log, clamp_volume, classify_socket, cursor_after_delete, entries_for_toasts,
-    fetch_health, health_check_due, health_needs_reconnect, load_message_log, plan_sync,
-    wipe_secret, without_known_ids,
+    append_message_log, clamp_digest_threshold, clamp_volume, classify_socket, cursor_after_delete,
+    entries_for_toasts, fetch_health, health_check_due, health_needs_reconnect, load_message_log,
+    plan_sync, split_for_delivery, wipe_secret, without_known_ids,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -30,6 +30,9 @@ pub enum SessionCommand {
     SetSound {
         enabled: bool,
         volume: u8,
+    },
+    SetDigestThreshold {
+        threshold: u8,
     },
     OpenMessage {
         id: u64,
@@ -74,15 +77,40 @@ pub enum SessionEvent {
     Status(String),
     TwoFactorRequired,
     LoginFailed(String),
-    LoggedIn { epoch: u64 },
-    LoggedOut { epoch: u64 },
-    Notify { epoch: u64, toast: Toast },
-    EmergencyAcknowledged { receipt: String },
-    Connection { epoch: u64, state: Connection },
-    BacklogDropped { epoch: u64, count: usize },
-    SessionLost { epoch: u64, message: String },
+    LoggedIn {
+        epoch: u64,
+    },
+    LoggedOut {
+        epoch: u64,
+    },
+    Notify {
+        epoch: u64,
+        toast: Toast,
+    },
+    /// A batch too large for single toasts. One summary, all rows in the log.
+    NotifyDigest {
+        epoch: u64,
+        toasts: Vec<Toast>,
+    },
+    EmergencyAcknowledged {
+        receipt: String,
+    },
+    Connection {
+        epoch: u64,
+        state: Connection,
+    },
+    BacklogDropped {
+        epoch: u64,
+        count: usize,
+    },
+    SessionLost {
+        epoch: u64,
+        message: String,
+    },
     Activate,
-    OpenMessage { id: u64 },
+    OpenMessage {
+        id: u64,
+    },
 }
 
 pub fn start(
@@ -172,6 +200,9 @@ async fn session_main(
             SessionCommand::Acknowledge { receipt } => live.acknowledge(&receipt).await,
             SessionCommand::Logout => live.logout().await,
             SessionCommand::SetSound { enabled, volume } => live.set_sound(enabled, volume),
+            SessionCommand::SetDigestThreshold { threshold } => {
+                live.set_digest_threshold(threshold)
+            }
             SessionCommand::OpenMessage { id } => {
                 let _ = live.events.unbounded_send(SessionEvent::OpenMessage { id });
             }
@@ -343,6 +374,14 @@ impl Live {
         state.sound_volume = clamp_volume(volume);
         if let Err(err) = state.save() {
             tracing::warn!("could not store sound setting: {err}");
+        }
+    }
+
+    fn set_digest_threshold(&self, threshold: u8) {
+        let mut state = lock_state(&self.state);
+        state.digest_threshold = clamp_digest_threshold(threshold);
+        if let Err(err) = state.save() {
+            tracing::warn!("could not store digest setting: {err}");
         }
     }
 
@@ -667,13 +706,7 @@ async fn sync_messages(
     }
 
     let mut emergencies = Vec::new();
-    for toast in toasts {
-        if !still_current(flag, epoch) {
-            return Ok(SyncReport {
-                discarded: plan.discarded,
-                delete_failed: false,
-            });
-        }
+    for toast in &toasts {
         if let Some(receipt) = toast.receipt.clone() {
             emergencies.push(PendingEmergency {
                 message_id: toast.message_id,
@@ -681,6 +714,18 @@ async fn sync_messages(
                 body: toast.body.clone(),
                 receipt,
                 sound: toast.sound.clone(),
+            });
+        }
+    }
+
+    let threshold = lock_state(state).digest_threshold;
+    let delivery = split_for_delivery(toasts, threshold);
+
+    for toast in delivery.single {
+        if !still_current(flag, epoch) {
+            return Ok(SyncReport {
+                discarded: plan.discarded,
+                delete_failed: false,
             });
         }
         let toast = with_sound(client, toast).await;
@@ -691,6 +736,22 @@ async fn sync_messages(
             });
         }
         send(events, SessionEvent::Notify { epoch, toast });
+    }
+
+    if !delivery.digest.is_empty() {
+        // One sound for the whole bundle, taken from the newest entry that has one.
+        let mut toasts = delivery.digest;
+        if let Some(index) = toasts.iter().rposition(|toast| toast.sound.is_some()) {
+            let sounded = with_sound(client, toasts[index].clone()).await;
+            toasts[index] = sounded;
+        }
+        if !still_current(flag, epoch) {
+            return Ok(SyncReport {
+                discarded: plan.discarded,
+                delete_failed: false,
+            });
+        }
+        send(events, SessionEvent::NotifyDigest { epoch, toasts });
     }
 
     let deleted = if let Some(id) = plan.delete_through {

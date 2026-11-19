@@ -19,12 +19,14 @@
 - Anmeldung im Einstellungsfenster (E-Mail, Passwort, optional 2FA, Gerätename)
 - `openover-core`: Login, Gerät `os=O`, Nachrichten, WebSocket mit Reconnect
 - Nach `!` werden neue Nachrichten als Systembenachrichtigung gezeigt (Titel, Text, App-Name)
+- Kommen mehrere Nachrichten auf einmal (etwa ein Stau nach längerer Offline-Zeit), gibt es ab drei Stück eine Sammelmeldung statt einzelner Toasts. Die Schwelle ist in den Einstellungen anpassbar, Notfälle kommen immer einzeln
+- Die Nachrichtenliste hat Suche, Prioritätsmarkierung, Kopieren und Löschen je Eintrag. Gespeichert werden die letzten 500 Nachrichten
 - Pushover-Sounds (`sounds/{code}.mp3`) werden lokal gecacht und unter Windows und macOS abgespielt. Priorität -1 bleibt stumm. Die Windows-Toasts selbst haben keinen Ton
 - Beim ersten Start wird eine große alte Warteschlange verworfen und einmal angezeigt. Die letzte Nachrichten-ID wird erst nach erfolgreichem Löschen gespeichert
 - Notfälle bleiben lokal und werden etwa alle 30 Sekunden erneut gezeigt, bis sie bestätigt sind
 - Tray: Einstellungen, Abmelden, Beenden. Der Tooltip zeigt den Verbindungszustand. Ein zweiter Start öffnet die laufende Instanz
 - Zugangsdaten im OS-Keyring (`user key`, `secret`, `device id`). Das Passwort wird nicht gespeichert. Abmelden löscht nur das Sitzungsgeheimnis
-- Keine Historie, keine Bildanhänge
+- Keine Bildanhänge
 
 Ohne gespeicherte Anmeldung öffnet sich das Fenster von selbst. Mit Anmeldung bleibt die App im Tray; Einstellungen liegen im Tray-Menü.
 

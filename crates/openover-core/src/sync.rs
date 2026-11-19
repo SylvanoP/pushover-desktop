@@ -12,6 +12,80 @@ use crate::types::Message;
 pub const STALE_BACKLOG_LIMIT: usize = 10;
 const TOAST_BODY_CHARS: usize = 400;
 
+/// Default for [`LocalState::digest_threshold`]: three ordinary messages in one
+/// batch become a single summary instead of three toasts.
+pub const DEFAULT_DIGEST_THRESHOLD: u8 = 3;
+/// Highest threshold the settings offer. Above this, bundling never kicks in.
+pub const MAX_DIGEST_THRESHOLD: u8 = 20;
+
+pub fn clamp_digest_threshold(threshold: u8) -> u8 {
+    threshold.min(MAX_DIGEST_THRESHOLD)
+}
+
+/// How one fetched batch reaches the user.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Delivery {
+    /// Shown as their own system notification, in order.
+    pub single: Vec<Toast>,
+    /// Folded into one summary notification. Empty when nothing is bundled.
+    pub digest: Vec<Toast>,
+}
+
+/// Splits a batch into single toasts and a bundled rest.
+///
+/// A queue that piled up while the app was offline arrives as one batch, and
+/// toasting every entry buries the screen. Emergencies never bundle: an unacked
+/// priority 2 message is the whole point of the app. A threshold of 0 turns
+/// bundling off.
+pub fn split_for_delivery(toasts: Vec<Toast>, threshold: u8) -> Delivery {
+    let (urgent, ordinary): (Vec<Toast>, Vec<Toast>) = toasts
+        .into_iter()
+        .partition(|toast| toast.receipt.is_some() || toast.priority >= 2);
+
+    if threshold == 0 || ordinary.len() < usize::from(threshold) {
+        let mut single = urgent;
+        single.extend(ordinary);
+        single.sort_by_key(|toast| toast.message_id);
+        return Delivery {
+            single,
+            digest: Vec::new(),
+        };
+    }
+
+    Delivery {
+        single: urgent,
+        digest: ordinary,
+    }
+}
+
+/// Headline and body for the bundled notification.
+pub fn digest_summary(toasts: &[Toast]) -> (String, String) {
+    let count = toasts.len();
+    let title = format!("{count} neue Nachrichten");
+    let mut apps: Vec<&str> = Vec::new();
+    for toast in toasts {
+        let app = toast.app.trim();
+        if !app.is_empty() && !apps.contains(&app) {
+            apps.push(app);
+        }
+    }
+    let body = match apps.len() {
+        0 => "Zum Lesen das Fenster öffnen.".to_string(),
+        1 => format!("Von {}. Zum Lesen das Fenster öffnen.", apps[0]),
+        2 => format!(
+            "Von {} und {}. Zum Lesen das Fenster öffnen.",
+            apps[0], apps[1]
+        ),
+        _ => format!(
+            "Von {}, {} und {} weiteren. Zum Lesen das Fenster öffnen.",
+            apps[0],
+            apps[1],
+            apps.len() - 2
+        ),
+    };
+    (title, body)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Toast {
     pub message_id: u64,
@@ -288,6 +362,115 @@ mod tests {
             sound: sound.map(str::to_string),
             sound_path: None,
         }
+    }
+
+    fn app_toast(id: u64, app: &str) -> Toast {
+        let mut toast = toast(id, None);
+        toast.app = app.into();
+        toast
+    }
+
+    fn emergency(id: u64) -> Toast {
+        let mut toast = toast(id, None);
+        toast.priority = 2;
+        toast.receipt = Some(format!("r{id}"));
+        toast
+    }
+
+    #[test]
+    fn a_small_batch_stays_single_toasts() {
+        let batch = vec![toast(1, None), toast(2, None)];
+        let delivery = split_for_delivery(batch, DEFAULT_DIGEST_THRESHOLD);
+        assert_eq!(delivery.single.len(), 2);
+        assert!(delivery.digest.is_empty());
+    }
+
+    #[test]
+    fn a_batch_at_the_threshold_is_bundled() {
+        let batch = vec![toast(1, None), toast(2, None), toast(3, None)];
+        let delivery = split_for_delivery(batch, DEFAULT_DIGEST_THRESHOLD);
+        assert!(delivery.single.is_empty());
+        assert_eq!(delivery.digest.len(), 3);
+    }
+
+    #[test]
+    fn emergencies_never_bundle() {
+        let batch = vec![toast(1, None), emergency(2), toast(3, None), toast(4, None)];
+        let delivery = split_for_delivery(batch, DEFAULT_DIGEST_THRESHOLD);
+        assert_eq!(
+            delivery
+                .single
+                .iter()
+                .map(|toast| toast.message_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(delivery.digest.len(), 3);
+    }
+
+    #[test]
+    fn a_threshold_of_zero_turns_bundling_off() {
+        let batch: Vec<_> = (1..=30).map(|id| toast(id, None)).collect();
+        let delivery = split_for_delivery(batch, 0);
+        assert_eq!(delivery.single.len(), 30);
+        assert!(delivery.digest.is_empty());
+        assert_eq!(delivery.single[0].message_id, 1);
+    }
+
+    #[test]
+    fn the_threshold_cannot_exceed_the_maximum() {
+        assert_eq!(clamp_digest_threshold(200), MAX_DIGEST_THRESHOLD);
+        assert_eq!(clamp_digest_threshold(3), 3);
+    }
+
+    #[test]
+    fn the_summary_names_the_apps_it_came_from() {
+        let (title, body) = digest_summary(&[app_toast(1, "Grafana"), app_toast(2, "Grafana")]);
+        assert_eq!(title, "2 neue Nachrichten");
+        assert!(body.starts_with("Von Grafana."), "{body}");
+
+        let (_, body) = digest_summary(&[app_toast(1, "Grafana"), app_toast(2, "hostleaf")]);
+        assert!(body.starts_with("Von Grafana und hostleaf."), "{body}");
+
+        let (_, body) = digest_summary(&[
+            app_toast(1, "Grafana"),
+            app_toast(2, "hostleaf"),
+            app_toast(3, "Backup"),
+            app_toast(4, "Uptime"),
+        ]);
+        assert!(
+            body.starts_with("Von Grafana, hostleaf und 2 weiteren."),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn a_queue_that_piled_up_offline_arrives_as_one_summary() {
+        // The cursor exists, so the stale-backlog rule no longer applies and
+        // every message would otherwise become its own toast.
+        let batch: Vec<_> = (101..=120).map(|id| message(id, 1)).collect();
+        let plan = plan_sync(&batch, Some(100), None, None, false);
+        assert_eq!(plan.toasts.len(), 20);
+
+        let delivery = split_for_delivery(plan.toasts, DEFAULT_DIGEST_THRESHOLD);
+        assert!(delivery.single.is_empty());
+        assert_eq!(delivery.digest.len(), 20);
+        let (title, _) = digest_summary(&delivery.digest);
+        assert_eq!(title, "20 neue Nachrichten");
+    }
+
+    #[test]
+    fn an_emergency_in_a_pile_still_arrives_on_its_own() {
+        let mut batch: Vec<_> = (101..=110).map(|id| message(id, 1)).collect();
+        let mut urgent = message(111, 2);
+        urgent.receipt = Some("r111".into());
+        batch.push(urgent);
+
+        let plan = plan_sync(&batch, Some(100), None, None, false);
+        let delivery = split_for_delivery(plan.toasts, DEFAULT_DIGEST_THRESHOLD);
+        assert_eq!(delivery.single.len(), 1);
+        assert_eq!(delivery.single[0].message_id, 111);
+        assert_eq!(delivery.digest.len(), 10);
     }
 
     #[test]
