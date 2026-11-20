@@ -137,6 +137,9 @@ lucide!(
     r##"<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18 6L6 18M6 6l12 12"/>"##
 );
 
+// Only the Windows build offers an in-app restart, so this is dead code
+// elsewhere and clippy -Dwarnings would reject it.
+#[cfg(windows)]
 lucide!(
     DOWNLOAD,
     "an update that is ready",
