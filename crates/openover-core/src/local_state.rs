@@ -6,6 +6,16 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Which palette the window uses. `System` follows the OS appearance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 /// An emergency that must stay on this machine until the user acknowledges it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingEmergency {
@@ -44,6 +54,9 @@ pub struct LocalState {
     /// 0 turns bundling off. Missing keys take the default.
     #[serde(default = "digest_threshold_by_default")]
     pub digest_threshold: u8,
+    /// Palette wish. A missing key follows the OS appearance.
+    #[serde(default)]
+    pub theme: ThemeChoice,
 }
 
 fn digest_threshold_by_default() -> u8 {
@@ -74,6 +87,7 @@ impl Default for LocalState {
             sound_volume: 100,
             start_with_windows: false,
             digest_threshold: crate::sync::DEFAULT_DIGEST_THRESHOLD,
+            theme: ThemeChoice::System,
         }
     }
 }
@@ -188,6 +202,7 @@ mod tests {
             sound_volume: 40,
             start_with_windows: true,
             digest_threshold: 5,
+            theme: ThemeChoice::Dark,
         };
         state.write(&path).unwrap();
         let loaded = LocalState::read(&path).unwrap();
@@ -205,6 +220,7 @@ mod tests {
             state.digest_threshold,
             crate::sync::DEFAULT_DIGEST_THRESHOLD
         );
+        assert_eq!(state.theme, ThemeChoice::System);
         assert_eq!(super::clamp_volume(140), 100);
         assert_eq!(super::clamp_volume(0), 0);
     }

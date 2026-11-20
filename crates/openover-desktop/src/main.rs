@@ -1,7 +1,9 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod components;
 mod form_theme;
 mod icon;
+mod icons;
 mod instance;
 #[cfg(any(windows, target_os = "macos"))]
 mod network;
@@ -36,6 +38,9 @@ struct Cli {
     /// Show a demo system notification at startup (no Pushover account required).
     #[arg(long)]
     demo_toast: bool,
+    /// Walk through every notification and in-app message once, for a preview.
+    #[arg(long)]
+    demo: bool,
     /// Download and play one Pushover sound, for example `bike`.
     #[arg(long, value_name = "CODE")]
     play_sound: Option<String>,
@@ -79,6 +84,9 @@ fn main() {
 
             if cli.demo_toast {
                 show_demo_notification(cx);
+            }
+            if cli.demo {
+                settings::demo(cx);
             }
             if let Some(code) = cli.play_sound.clone() {
                 play_sound_code(&code, false);
