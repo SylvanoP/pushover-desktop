@@ -318,7 +318,15 @@ mod tests {
 
     #[test]
     fn user_agent_matches_policy() {
-        assert_eq!(USER_AGENT, "openover-desktop/0.1.3 (Rust; Open Client)");
+        // Built from CARGO_PKG_VERSION, so the expected string is too: pinning
+        // the version here meant the test broke on every release.
+        assert_eq!(
+            USER_AGENT,
+            format!(
+                "openover-desktop/{} (Rust; Open Client)",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
         assert!(USER_AGENT.contains("openover-desktop"));
         assert!(USER_AGENT.contains("Open Client"));
     }
