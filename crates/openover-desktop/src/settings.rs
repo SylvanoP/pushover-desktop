@@ -1,27 +1,50 @@
 use std::time::Duration;
 
-use crate::form_theme::{FormTheme, field_chrome, field_height};
+use crate::components::{
+    ButtonVariant, button, button_with, empty_state, field_group, icon_button, inline_action,
+    inline_action_with, link, message_line, section, segmented, setting_row, switch, tab,
+};
+use crate::form_theme::{
+    CONTROL_HEIGHT, FormTheme, LABEL_WIDTH, MessageKind, RADIUS_LG, RADIUS_MD, field_chrome, space,
+};
+use crate::icons;
 use crate::password_field::MaskedPassword;
 use crate::session::{Connection, SessionCommand, SessionCommands, SessionEvent};
 use crate::unread::{DotEvent, UnreadDot, unread_dot};
 
 use futures_util::StreamExt as _;
 use gpui::{
-    Animation, AnimationExt, App, Bounds, ClipboardItem, Context, DispatchPhase, Entity, Focusable,
-    Global, Hitbox, KeyDownEvent, MouseButton, MouseMoveEvent, Pixels, Point, SharedString,
-    Subscription, SystemNotification, SystemNotificationAction, TitlebarOptions, Window,
-    WindowBounds, WindowHandle, WindowOptions, div, prelude::*, pulsating_between, px, relative,
-    rgb_to_hsla, size,
+    Animation, AnimationExt, App, Bounds, ClipboardItem, ColorExt as _, Context, DispatchPhase,
+    Entity, Focusable, Global, Hitbox, KeyDownEvent, MouseButton, MouseMoveEvent, Pixels, Point,
+    SharedString, Subscription, SystemNotification, SystemNotificationAction, TitlebarOptions,
+    Window, WindowBounds, WindowHandle, WindowOptions, div, ease_out_quint, prelude::*,
+    pulsating_between, px, relative, rgb_to_hsla, size,
 };
 use gpui_ce_elements::editable_text::{
     EditableTextState, StringStorage, TextChanged,
     actions::{DEFAULT_INPUT_CONTEXT, default_bindings},
-    text_input,
+    text_area, text_input,
 };
 use openover_core::{
-    CredentialStore, DEFAULT_DEVICE_NAME, LocalState, LoggedMessage, MAX_DIGEST_THRESHOLD, Toast,
-    clamp_digest_threshold, clamp_volume, validate_device_name,
+    CredentialStore, DEFAULT_DEVICE_NAME, LocalState, LoggedMessage, MAX_DIGEST_THRESHOLD,
+    ThemeChoice, Toast, clamp_digest_threshold, clamp_volume, validate_device_name,
 };
+
+/// How long "Kopiert" stays where the click happened.
+const COPIED_FEEDBACK: Duration = Duration::from_millis(1500);
+/// How long a notice stays at the bottom of the window.
+const NOTICE_LIFE: Duration = Duration::from_secs(4);
+/// Errors get longer, because they usually ask the user to do something.
+const NOTICE_LIFE_LONG: Duration = Duration::from_secs(8);
+/// Above this many characters a notice is treated as long: it gets a "Mehr"
+/// control and stops expiring on its own.
+const NOTICE_SHORT_CHARS: usize = 70;
+/// How many lines an expanded notice may fill before it scrolls.
+const NOTICE_MAX_LINES: usize = 8;
+/// Length of the open-and-close motion of a message row.
+const EXPAND_DURATION: Duration = Duration::from_millis(260);
+/// The content fades a little faster than the row opens.
+const OPACITY_DURATION: Duration = Duration::from_millis(160);
 
 struct SettingsState(Entity<Settings>);
 
@@ -31,6 +54,36 @@ struct SettingsWindow(WindowHandle<Settings>);
 impl Global for SettingsState {}
 impl Global for SettingsWindow {}
 impl Global for SessionCommands {}
+
+/// A message at the bottom of the window. `seq` keys its animation, so a new
+/// message replacing an old one animates in rather than appearing silently.
+#[derive(Clone)]
+struct Notice {
+    text: SharedString,
+    kind: MessageKind,
+    seq: u64,
+    /// True once the user opened it, which shows the text in full.
+    expanded: bool,
+}
+
+impl Notice {
+    /// Whether the text is long enough to need more than the collapsed height.
+    ///
+    /// Counted in characters rather than measured: the notice is one line of
+    /// known width, and a measurement would mean a layout pass per frame.
+    fn is_long(&self) -> bool {
+        self.text.chars().count() > NOTICE_SHORT_CHARS
+    }
+}
+
+/// Which field an error belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Email,
+    Password,
+    TwoFactor,
+    DeviceName,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -71,14 +124,26 @@ pub struct Settings {
     search: Entity<EditableTextState>,
     confirm_clear: bool,
     selected_id: Option<u64>,
+    /// The row still shrinking after a close. It keeps its content mounted until
+    /// the height transition has run out.
+    closing_id: Option<u64>,
     epoch: u64,
-    status: SharedString,
+    /// Transient feedback shown at the bottom of the window. Every message that
+    /// is about something that just happened goes here, so there is one place to
+    /// look instead of the four the pane used to have.
+    notice: Option<Notice>,
+    notice_seq: u64,
+    /// Errors that belong to a field and stay until the field is fixed.
+    form_error: Option<(Field, SharedString)>,
+    theme: ThemeChoice,
+    copied_id: Option<u64>,
+    /// Open height per message, measured on first open. A transition cannot run
+    /// toward `auto`, so the target has to be a number.
+    row_heights: std::collections::HashMap<u64, Pixels>,
     pending_emergency: Option<(String, String)>,
     unread: UnreadDot,
     #[cfg(any(windows, target_os = "macos"))]
     start_with_windows: bool,
-    #[cfg(any(windows, target_os = "macos"))]
-    autostart_note: SharedString,
     #[cfg(not(target_os = "macos"))]
     update_busy: bool,
     #[cfg(not(target_os = "macos"))]
@@ -106,7 +171,8 @@ impl Settings {
             cx.subscribe(&twofa, |_, _, _: &TextChanged, cx| cx.notify()),
             cx.subscribe(&search, |_, _, _: &TextChanged, cx| cx.notify()),
         ];
-        let messages = openover_core::load_message_log();
+        let mut messages = openover_core::load_message_log();
+        sort_newest_first(&mut messages);
         let unread = UnreadDot::at_start(false, messages.iter().map(|message| message.id));
 
         Self {
@@ -128,14 +194,21 @@ impl Settings {
             search,
             confirm_clear: false,
             selected_id: None,
+            closing_id: None,
             epoch: 0,
-            status: SharedString::default(),
+            notice: None,
+            notice_seq: 0,
+            form_error: None,
+            theme: {
+                crate::form_theme::remember_wish(stored.theme);
+                stored.theme
+            },
+            copied_id: None,
+            row_heights: std::collections::HashMap::new(),
             pending_emergency: None,
             unread,
             #[cfg(any(windows, target_os = "macos"))]
             start_with_windows: remembered_autostart(),
-            #[cfg(any(windows, target_os = "macos"))]
-            autostart_note: SharedString::default(),
             #[cfg(not(target_os = "macos"))]
             update_busy: false,
             #[cfg(not(target_os = "macos"))]
@@ -154,24 +227,24 @@ impl Settings {
         let password = self.password.read(cx).secret().to_string();
 
         if email.is_empty() || !email.contains('@') {
-            self.set_status("Bitte eine E-Mail-Adresse eingeben.", cx);
+            self.fail_field(Field::Email, "Bitte eine E-Mail-Adresse eingeben.", cx);
             return;
         }
         if password.is_empty() {
-            self.set_status("Bitte das Passwort eingeben.", cx);
+            self.fail_field(Field::Password, "Bitte das Passwort eingeben.", cx);
             return;
         }
         if let Err(err) = validate_device_name(&device_name) {
-            self.set_status(format!("Gerätename: {err}"), cx);
+            self.fail_field(Field::DeviceName, err.to_string(), cx);
             return;
         }
         if self.show_twofa && twofa.is_empty() {
-            self.set_status("Bitte den Zwei-Faktor-Code eingeben.", cx);
+            self.fail_field(Field::TwoFactor, "Bitte den Zwei-Faktor-Code eingeben.", cx);
             return;
         }
 
         let Some(commands) = cx.try_global::<SessionCommands>() else {
-            self.set_status("Anmeldung ist noch nicht bereit.", cx);
+            self.notify_user("Anmeldung ist noch nicht bereit.", MessageKind::Error, cx);
             return;
         };
         let sent = commands.0.send(SessionCommand::Login {
@@ -181,20 +254,28 @@ impl Settings {
             device_name,
         });
         if sent.is_err() {
-            self.set_status("Anmeldung konnte nicht gestartet werden.", cx);
+            self.notify_user(
+                "Anmeldung konnte nicht gestartet werden.",
+                MessageKind::Error,
+                cx,
+            );
             return;
         }
         self.busy = true;
-        self.set_status("Anmeldung läuft…", cx);
+        self.notify_user("Anmeldung läuft…", MessageKind::Info, cx);
     }
 
     fn logout(&mut self, cx: &mut Context<Self>) {
         let Some(commands) = cx.try_global::<SessionCommands>() else {
-            self.set_status("Abmelden ist noch nicht bereit.", cx);
+            self.notify_user("Abmelden ist noch nicht bereit.", MessageKind::Error, cx);
             return;
         };
         if commands.0.send(SessionCommand::Logout).is_err() {
-            self.set_status("Abmelden konnte nicht gestartet werden.", cx);
+            self.notify_user(
+                "Abmelden konnte nicht gestartet werden.",
+                MessageKind::Error,
+                cx,
+            );
         }
     }
 
@@ -268,6 +349,7 @@ impl Settings {
 
     fn reload_messages(&mut self) {
         self.messages = openover_core::load_message_log();
+        sort_newest_first(&mut self.messages);
     }
 
     fn ask_clear(&mut self, cx: &mut Context<Self>) {
@@ -302,7 +384,7 @@ impl Settings {
             return;
         };
         send_acknowledge(cx, &receipt);
-        self.set_status("Bestätigung wird gesendet…", cx);
+        self.notify_user("Bestätigung wird gesendet…", MessageKind::Info, cx);
     }
 
     fn accept_epoch(&mut self, epoch: u64) -> bool {
@@ -316,20 +398,32 @@ impl Settings {
     fn apply(&mut self, event: SessionEvent, cx: &mut Context<Self>) -> bool {
         let mut open_settings = false;
         match event {
-            SessionEvent::Status(text) => self.status = text.into(),
+            SessionEvent::Status(text) => self.notify_user(text, MessageKind::Info, cx),
             SessionEvent::TwoFactorRequired => {
                 let retry = self.show_twofa;
                 self.show_twofa = true;
                 self.busy = false;
-                self.status = if retry {
-                    "Der Code wurde nicht akzeptiert. Bitte einen neuen eingeben.".into()
+                if retry {
+                    self.fail_field(
+                        Field::TwoFactor,
+                        "Der Code wurde nicht akzeptiert. Bitte einen neuen eingeben.",
+                        cx,
+                    );
                 } else {
-                    "Dieses Konto braucht einen Zwei-Faktor-Code.".into()
-                };
+                    self.notify_user(
+                        "Dieses Konto braucht einen Zwei-Faktor-Code.",
+                        MessageKind::Info,
+                        cx,
+                    );
+                }
             }
             SessionEvent::LoginFailed(detail) => {
                 self.busy = false;
-                self.status = format!("Anmeldung fehlgeschlagen: {detail}").into();
+                self.notify_user(
+                    format!("Anmeldung fehlgeschlagen: {detail}"),
+                    MessageKind::Error,
+                    cx,
+                );
             }
             SessionEvent::LoggedIn { epoch } => {
                 if !self.accept_epoch(epoch) {
@@ -342,7 +436,8 @@ impl Settings {
                 self.show_twofa = false;
                 self.password.update(cx, |password, cx| password.clear(cx));
                 self.twofa.update(cx, |twofa, cx| twofa.emplace("", cx));
-                self.status = SharedString::default();
+                self.notice = None;
+                self.form_error = None;
             }
             SessionEvent::LoggedOut { epoch } => {
                 if !self.accept_epoch(epoch) {
@@ -354,7 +449,8 @@ impl Settings {
                 self.pane = Pane::Account;
                 self.pending_emergency = None;
                 self.confirm_clear = false;
-                self.status = SharedString::default();
+                self.notice = None;
+                self.form_error = None;
                 crate::tray::set_tooltip_text(cx, Connection::SignedOut.tooltip());
                 open_settings = true;
             }
@@ -378,7 +474,8 @@ impl Settings {
                 }
                 show_digest(cx, &toasts, self.sound_enabled, self.sound_volume);
                 self.reload_messages();
-                self.status = format!("{} neue Nachrichten.", toasts.len()).into();
+                let count = toasts.len();
+                self.notify_user(format!("{count} neue Nachrichten."), MessageKind::Info, cx);
             }
             SessionEvent::EmergencyAcknowledged { receipt } => {
                 if self
@@ -388,7 +485,7 @@ impl Settings {
                 {
                     self.pending_emergency = None;
                 }
-                self.status = "Notfall bestätigt.".into();
+                self.notify_user("Notfall bestätigt.", MessageKind::Success, cx);
             }
             SessionEvent::Connection { epoch, state } => {
                 if !self.accept_epoch(epoch) {
@@ -402,10 +499,13 @@ impl Settings {
                     return false;
                 }
                 show_backlog_toast(cx, count);
-                self.status = format!(
-                    "{count} ältere Nachrichten beim ersten Abruf verworfen. Ab jetzt nur neue."
-                )
-                .into();
+                self.notify_user(
+                    format!(
+                        "{count} ältere Nachrichten beim ersten Abruf verworfen. Ab jetzt nur neue."
+                    ),
+                    MessageKind::Info,
+                    cx,
+                );
             }
             SessionEvent::SessionLost { epoch, message } => {
                 if !self.accept_epoch(epoch) {
@@ -416,7 +516,7 @@ impl Settings {
                 self.connection = Connection::SessionEnded;
                 self.pane = Pane::Account;
                 self.confirm_clear = false;
-                self.status = message.into();
+                self.notify_user(message, MessageKind::Error, cx);
                 crate::tray::set_tooltip_text(cx, Connection::SessionEnded.tooltip());
                 open_settings = true;
             }
@@ -441,9 +541,136 @@ impl Settings {
         }
     }
 
-    fn set_status(&mut self, status: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.status = status.into();
+    fn choose_theme(&mut self, choice: ThemeChoice, cx: &mut Context<Self>) {
+        if self.theme == choice {
+            return;
+        }
+        self.theme = choice;
+        crate::form_theme::remember_wish(choice);
+        let mut state = LocalState::load();
+        state.theme = choice;
+        if let Err(err) = state.save() {
+            tracing::warn!("could not store theme wish: {err}");
+        }
         cx.notify();
+    }
+
+    /// Opens a row, or closes it and keeps it mounted while it shrinks.
+    fn toggle_row(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self.selected_id == Some(id) {
+            self.selected_id = None;
+            self.closing_id = Some(id);
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(EXPAND_DURATION).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.closing_id == Some(id) {
+                        this.closing_id = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+            return;
+        }
+        self.selected_id = Some(id);
+        self.closing_id = None;
+        cx.notify();
+    }
+
+    /// Stores the open height of a row. Only a real change redraws, otherwise the
+    /// measurement during the transition would notify on every frame.
+    fn remember_height(&mut self, id: u64, height: Pixels, cx: &mut Context<Self>) {
+        let known = self.row_heights.get(&id).copied();
+        if known.is_some_and(|known| (known - height).abs() < px(0.5)) {
+            return;
+        }
+        self.row_heights.insert(id, height);
+        cx.notify();
+    }
+
+    /// Confirms a copy where the click happened, and clears it again on its own.
+    fn mark_copied(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.copied_id = Some(id);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COPIED_FEEDBACK).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.copied_id == Some(id) {
+                    this.copied_id = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Shows a message at the bottom of the window and lets it expire on its own.
+    ///
+    /// One spawned timer per message, never a per-frame check: a notice that
+    /// re-rendered the window on every frame is exactly what made the list lag.
+    fn notify_user(
+        &mut self,
+        text: impl Into<SharedString>,
+        kind: MessageKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.notice_seq += 1;
+        let seq = self.notice_seq;
+        let notice = Notice {
+            text: text.into(),
+            kind,
+            seq,
+            expanded: false,
+        };
+        // A long message stays until the user dismisses it. Expiring it would
+        // mean the text vanishes mid-read, and a long one is usually the one
+        // worth reading.
+        let life = match (kind, notice.is_long()) {
+            (_, true) => None,
+            (MessageKind::Error, false) => Some(NOTICE_LIFE_LONG),
+            _ => Some(NOTICE_LIFE),
+        };
+        self.notice = Some(notice);
+        cx.notify();
+        let Some(life) = life else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(life).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.notice.as_ref().is_some_and(|notice| notice.seq == seq) {
+                    this.notice = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_notice(&mut self, cx: &mut Context<Self>) {
+        if let Some(notice) = self.notice.as_mut() {
+            notice.expanded = !notice.expanded;
+            cx.notify();
+        }
+    }
+
+    fn dismiss_notice(&mut self, cx: &mut Context<Self>) {
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// Marks a field as wrong. Stays until the next attempt clears it.
+    fn fail_field(&mut self, field: Field, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.form_error = Some((field, text.into()));
+        cx.notify();
+    }
+
+    fn error_for(&self, field: Field) -> Option<SharedString> {
+        self.form_error
+            .as_ref()
+            .filter(|(which, _)| *which == field)
+            .map(|(_, text)| text.clone())
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -519,12 +746,10 @@ impl Settings {
     fn toggle_autostart(&mut self, cx: &mut Context<Self>) {
         let next = !self.start_with_windows;
         if let Err(err) = crate::startup::write_enabled(next) {
-            self.autostart_note = format!("Autostart: {err}").into();
-            cx.notify();
+            self.notify_user(format!("Autostart: {err}"), MessageKind::Error, cx);
             return;
         }
         self.start_with_windows = next;
-        self.autostart_note = SharedString::default();
         let mut state = LocalState::load();
         state.start_with_windows = next;
         if let Err(err) = state.save() {
@@ -536,7 +761,7 @@ impl Settings {
 
 impl Render for Settings {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = FormTheme::for_window(window);
+        let theme = FormTheme::resolve(self.theme, window);
         let email_focused = self.email.read(cx).focus_handle(cx).is_focused(window);
         let twofa_focused = self.twofa.read(cx).focus_handle(cx).is_focused(window);
         let device_focused = self
@@ -547,15 +772,19 @@ impl Render for Settings {
         let search_focused = self.search.read(cx).focus_handle(cx).is_focused(window);
         let device_name = self.device_name.read(cx).as_str().trim().to_string();
         let email = self.email.read(cx).as_str().trim().to_string();
-        let name_error = validate_device_name(&device_name)
-            .err()
-            .map(|err| err.to_string());
+        // A name the user is still typing is not yet an error: the stored error
+        // from the last attempt wins, otherwise validate what is there now.
+        let name_error = self.error_for(Field::DeviceName).or_else(|| {
+            validate_device_name(&device_name)
+                .err()
+                .filter(|_| !device_name.is_empty())
+                .map(|err| SharedString::from(err.to_string()))
+        });
         let button_label = if self.busy {
             "Anmeldung läuft…"
         } else {
             "Anmelden"
         };
-        let status = self.status.clone();
 
         div()
             .id("openover-settings")
@@ -570,12 +799,24 @@ impl Render for Settings {
                 }
             }))
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(theme.surface)
             .text_sm()
             .text_color(theme.text)
             .child(top_bar(self, &theme, cx))
+            // Outside the scrolling pane on purpose: inside it, the card scrolled
+            // away with the message list and the acknowledgement was unreachable.
+            .when_some(self.pending_emergency.clone(), |root, (_, title)| {
+                root.child(
+                    div()
+                        .flex_shrink_0()
+                        .px(space(5))
+                        .pt(space(4))
+                        .child(emergency_card(title, &theme, cx)),
+                )
+            })
             .child(
                 div()
                     .id("openover-content")
@@ -583,16 +824,19 @@ impl Render for Settings {
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .gap(px(16.))
-                    .px(px(20.))
-                    .py(px(16.))
+                    .gap(space(4))
+                    .px(space(5))
+                    .py(space(4))
                     .child(match self.pane {
                         Pane::Account => account_pane(
                             &AccountPane {
                                 settings: self,
                                 theme: &theme,
                                 email: &email,
-                                name_error: name_error.as_deref(),
+                                name_error: name_error.clone(),
+                                email_error: self.error_for(Field::Email),
+                                password_error: self.error_for(Field::Password),
+                                twofa_error: self.error_for(Field::TwoFactor),
                                 email_focused,
                                 twofa_focused,
                                 device_focused,
@@ -601,29 +845,123 @@ impl Render for Settings {
                             cx,
                         ),
                         Pane::Preferences => preferences_pane(self, &theme, &device_name, cx),
-                        Pane::Messages => messages_pane(self, &theme, search_focused, cx),
-                    })
-                    .when_some(self.pending_emergency.clone(), |form, (_, title)| {
-                        form.child(emergency_card(title, &theme, cx))
-                    })
-                    .when(!status.is_empty(), |form| {
-                        form.child(
-                            div()
-                                .text_color(theme.quiet)
-                                .whitespace_normal()
-                                .child(status),
-                        )
+                        Pane::Messages => messages_pane(self, &theme, search_focused, window, cx),
                     }),
             )
+            .when_some(self.notice.clone(), |window_root, notice| {
+                window_root.child(notice_area(&notice, &theme, cx))
+            })
     }
 }
 
-#[derive(Clone, Copy)]
+/// The one place transient feedback appears: floating over the bottom of the
+/// window, so it is visible no matter how far the pane is scrolled.
+/// The one place transient feedback appears: floating over the bottom of the
+/// window, so it is visible no matter how far the pane is scrolled.
+///
+/// A short message is one line and expires. A long one - a server's error text,
+/// for instance - is clamped to two lines with a "Mehr" control, stays until it
+/// is dismissed, and scrolls once expanded rather than growing over the window.
+fn notice_area(notice: &Notice, theme: &FormTheme, cx: &mut Context<Settings>) -> impl IntoElement {
+    let long = notice.is_long();
+    let expanded = notice.expanded;
+    let color = notice.kind.color(theme);
+    let glyph = notice.kind.glyph();
+
+    let text = div()
+        .id("notice-text")
+        .flex_1()
+        .min_w_0()
+        .text_xs()
+        .text_color(theme.text)
+        .whitespace_normal();
+    let text = if expanded {
+        text.max_h(px(16. * NOTICE_MAX_LINES as f32))
+            .overflow_y_scroll()
+            .child(notice.text.clone())
+    } else {
+        text.line_clamp(2).child(notice.text.clone())
+    };
+
+    div()
+        .absolute()
+        .bottom(space(4))
+        .left(space(5))
+        .right(space(5))
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .w_full()
+                .max_w(px(420.))
+                .flex()
+                .items_start()
+                .gap(space(3))
+                .px(space(3))
+                .py(space(3))
+                .rounded(RADIUS_MD)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.raised)
+                .shadow_md()
+                .child(
+                    div()
+                        .size(px(22.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(color.opacity(0.15))
+                        .text_color(color)
+                        .child(crate::icons::icon(glyph, px(14.), color)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(space(1))
+                        .child(text)
+                        .when(long, |block| {
+                            block.child(
+                                inline_action(
+                                    "notice-more",
+                                    if expanded { "Weniger" } else { "Mehr" },
+                                    ButtonVariant::Primary,
+                                    theme,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_notice(cx))),
+                            )
+                        }),
+                )
+                .child(
+                    inline_action_with(
+                        "notice-close",
+                        "",
+                        Some(icons::CLOSE),
+                        ButtonVariant::Ghost,
+                        theme,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.dismiss_notice(cx))),
+                )
+                .with_animation(
+                    SharedString::from(format!("notice-{}", notice.seq)),
+                    Animation::new(Duration::from_millis(200)).with_easing(ease_out_quint()),
+                    |block, delta| block.opacity(delta).bottom(px(-6. + 6. * delta)),
+                ),
+        )
+}
+
 struct AccountPane<'a> {
     settings: &'a Settings,
     theme: &'a FormTheme,
     email: &'a str,
-    name_error: Option<&'a str>,
+    name_error: Option<SharedString>,
+    email_error: Option<SharedString>,
+    password_error: Option<SharedString>,
+    twofa_error: Option<SharedString>,
     email_focused: bool,
     twofa_focused: bool,
     device_focused: bool,
@@ -636,30 +974,78 @@ fn account_pane(pane: &AccountPane<'_>, cx: &mut Context<Settings>) -> gpui::Div
         theme,
         email,
         name_error,
+        email_error,
+        password_error,
+        twofa_error,
         email_focused,
         twofa_focused,
         device_focused,
         button_label,
-    } = *pane;
+    } = pane;
+    let (email, button_label) = (*email, *button_label);
+    let (email_focused, twofa_focused, device_focused) =
+        (*email_focused, *twofa_focused, *device_focused);
     if settings.logged_in {
+        let shown = if email.is_empty() {
+            "Angemeldet".to_string()
+        } else {
+            email.to_string()
+        };
         return div()
             .flex()
             .flex_col()
-            .gap(px(16.))
-            .when(!email.is_empty(), |block| {
-                block.child(div().child(email.to_string()))
-            })
+            .gap(space(4))
             .child(
-                primary_button("logout", "Abmelden", theme)
-                    .on_click(cx.listener(|this, _, _, cx| this.logout(cx))),
-            );
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(space(3))
+                    .p(space(4))
+                    .rounded(RADIUS_LG)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.raised)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(space(1))
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.quiet)
+                                    .child("Angemeldetes Konto"),
+                            )
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_color(theme.text)
+                                    .child(shown),
+                            ),
+                    )
+                    .child(
+                        button_with(
+                            "logout",
+                            "Abmelden",
+                            Some(icons::LOGOUT),
+                            ButtonVariant::Secondary,
+                            theme,
+                        )
+                        .tab_index(10)
+                        .on_click(cx.listener(|this, _, _, cx| this.logout(cx))),
+                    ),
+            )
+            .child(account_links(theme));
     }
 
     div()
         .flex()
         .flex_col()
-        .gap(px(16.))
-        .child(labeled(
+        .gap(space(4))
+        .child(field_group(
             "E-Mail",
             text_field(
                 "email",
@@ -668,10 +1054,17 @@ fn account_pane(pane: &AccountPane<'_>, cx: &mut Context<Settings>) -> gpui::Div
                 theme,
                 email_focused,
             ),
+            email_error.clone(),
+            theme,
         ))
-        .child(labeled("Passwort", settings.password.clone()))
+        .child(field_group(
+            "Passwort",
+            settings.password.clone(),
+            password_error.clone(),
+            theme,
+        ))
         .when(settings.show_twofa, |form| {
-            form.child(labeled(
+            form.child(field_group(
                 "Zwei-Faktor-Code",
                 text_field(
                     "twofa",
@@ -680,9 +1073,11 @@ fn account_pane(pane: &AccountPane<'_>, cx: &mut Context<Settings>) -> gpui::Div
                     theme,
                     twofa_focused,
                 ),
+                twofa_error.clone(),
+                theme,
             ))
         })
-        .child(labeled(
+        .child(field_group(
             "Gerätename",
             text_field(
                 "device-name",
@@ -691,12 +1086,13 @@ fn account_pane(pane: &AccountPane<'_>, cx: &mut Context<Settings>) -> gpui::Div
                 theme,
                 device_focused,
             ),
+            name_error.clone(),
+            theme,
         ))
-        .when_some(name_error, |form, error| {
-            form.child(div().text_color(theme.quiet).child(error.to_string()))
-        })
         .child(
-            primary_button("login", button_label, theme)
+            button("login", button_label, ButtonVariant::Primary, theme)
+                .w_full()
+                .tab_index(20)
                 .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
         )
         .child(account_links(theme))
@@ -708,51 +1104,112 @@ fn preferences_pane(
     device_name: &str,
     cx: &mut Context<Settings>,
 ) -> gpui::Div {
-    let shown_name = if device_name.is_empty() {
-        "noch nicht festgelegt".to_string()
-    } else {
-        device_name.to_string()
-    };
-    let sound_label = if settings.sound_enabled { "An" } else { "Aus" };
-    let pane = div()
+    let notifications = section("Benachrichtigungen", theme)
+        .child(sound_row(settings, theme, cx))
+        .child(digest_row(settings, theme, cx));
+
+    let device = section("Gerät", theme).child(setting_row(
+        "Gerätename",
+        device_name_value(device_name, theme),
+        Some("Wird im Konto-Tab geändert.".into()),
+        theme,
+    ));
+
+    let appearance = section("Darstellung", theme).child(theme_row(settings, theme, cx));
+
+    let system = section("System", theme);
+    #[cfg(any(windows, target_os = "macos"))]
+    let system = system.child(autostart_row(settings, theme, cx));
+    #[cfg(not(target_os = "macos"))]
+    let system = system.child(update_row(settings, theme, cx));
+
+    div()
         .flex()
         .flex_col()
-        .gap(px(16.))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(12.))
-                .child(
-                    field_chrome(div().id("sound-toggle"), theme, settings.sound_enabled)
-                        .w(px(140.))
-                        .flex_shrink_0()
-                        .cursor_pointer()
-                        .justify_between()
-                        .child("Ton")
-                        .child(
-                            div()
-                                .text_color(if settings.sound_enabled {
-                                    theme.accent
-                                } else {
-                                    theme.quiet
-                                })
-                                .child(sound_label),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sound(cx))),
-                )
-                .child(div().flex_1().child(volume_slider(settings, theme, cx))),
-        )
-        .child(digest_row(settings, theme, cx))
-        .child(labeled(
-            "Gerätename",
-            field_chrome(div(), theme, false).child(shown_name),
-        ));
-    #[cfg(any(windows, target_os = "macos"))]
-    let pane = pane.child(autostart_row(settings, theme, cx));
-    #[cfg(not(target_os = "macos"))]
-    let pane = pane.child(update_row(settings, theme, cx));
-    pane
+        .gap(space(6))
+        .child(notifications)
+        .child(appearance)
+        .child(device)
+        .child(system)
+}
+
+/// The stored name, shown as text rather than in a field: the editable one is in
+/// the account pane, and two fields for one value is what confused the old pane.
+fn device_name_value(device_name: &str, theme: &FormTheme) -> impl IntoElement {
+    let empty = device_name.is_empty();
+    div()
+        .h(CONTROL_HEIGHT)
+        .flex()
+        .items_center()
+        .text_color(if empty { theme.placeholder } else { theme.text })
+        .child(if empty {
+            "noch nicht festgelegt".to_string()
+        } else {
+            device_name.to_string()
+        })
+}
+
+fn sound_row(
+    settings: &Settings,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> impl IntoElement {
+    setting_row(
+        "Ton",
+        div()
+            .flex()
+            .items_center()
+            .gap(space(3))
+            .child(switch(
+                "sound-toggle",
+                settings.sound_enabled,
+                30,
+                theme,
+                cx.listener(|this, _, _, cx| this.toggle_sound(cx)),
+            ))
+            .child(crate::icons::icon(
+                if settings.sound_enabled {
+                    icons::VOLUME
+                } else {
+                    icons::VOLUME_OFF
+                },
+                crate::icons::icon_size_sm(),
+                if settings.sound_enabled {
+                    theme.quiet
+                } else {
+                    theme.placeholder
+                },
+            ))
+            .child(div().flex_1().child(volume_slider(settings, theme, cx))),
+        None,
+        theme,
+    )
+}
+
+fn theme_row(
+    settings: &Settings,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> impl IntoElement {
+    let view = cx.entity().downgrade();
+    setting_row(
+        "Erscheinungsbild",
+        segmented(
+            "theme-choice",
+            &[
+                (ThemeChoice::System, "System", "theme-system", icons::SYSTEM),
+                (ThemeChoice::Light, "Hell", "theme-light", icons::LIGHT),
+                (ThemeChoice::Dark, "Dunkel", "theme-dark", icons::DARK),
+            ],
+            settings.theme,
+            theme,
+            move |choice, _, cx| {
+                let _ = view.update(cx, |this, cx| this.choose_theme(choice, cx));
+            },
+        ),
+        None,
+        theme,
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -761,37 +1218,40 @@ fn update_row(
     theme: &FormTheme,
     cx: &mut Context<Settings>,
 ) -> impl IntoElement {
-    let detail = match &settings.update_line {
-        UpdateLine::Idle => String::new(),
-        UpdateLine::Checking => "Prüfe…".to_string(),
-        UpdateLine::Current => "Aktuell".to_string(),
-        #[cfg(windows)]
-        UpdateLine::Ready { version, .. } => format!("Version {version} bereit"),
-        UpdateLine::Failed(message) => message.clone(),
-    };
-    let failed = matches!(settings.update_line, UpdateLine::Failed(_));
     let busy = settings.update_busy;
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(8.))
-        .child(
+    let state: Option<(String, MessageKind)> = match &settings.update_line {
+        UpdateLine::Idle => None,
+        UpdateLine::Checking => Some(("Prüfe…".to_string(), MessageKind::Info)),
+        UpdateLine::Current => Some(("Aktuell".to_string(), MessageKind::Success)),
+        #[cfg(windows)]
+        UpdateLine::Ready { version, .. } => Some((
+            format!("Version {version} ist bereit."),
+            MessageKind::Success,
+        )),
+        UpdateLine::Failed(message) => Some((message.clone(), MessageKind::Error)),
+    };
+    let row = setting_row(
+        "Version",
+        div()
+            .flex()
+            .items_center()
+            .gap(space(3))
+            .child(
+                div()
+                    .text_color(theme.quiet)
+                    .child(SharedString::from(env!("CARGO_PKG_VERSION"))),
+            )
+            .child(update_actions(settings, theme, busy, cx)),
+        None,
+        theme,
+    );
+    row.when_some(state, |row, (text, kind)| {
+        row.child(
             div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(12.))
-                .child(SharedString::from(format!(
-                    "Version {}",
-                    env!("CARGO_PKG_VERSION")
-                )))
-                .child(
-                    div()
-                        .text_color(if failed { theme.stopped } else { theme.quiet })
-                        .child(SharedString::from(detail)),
-                ),
+                .pl(LABEL_WIDTH + space(3))
+                .child(message_line(text, kind, theme)),
         )
-        .child(update_actions(settings, theme, busy, cx))
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -801,13 +1261,19 @@ fn update_actions(
     busy: bool,
     cx: &mut Context<Settings>,
 ) -> gpui::Div {
-    let row = div().flex().items_center().gap(px(16.)).child(
-        div()
-            .id("search-updates")
-            .cursor_pointer()
-            .text_color(if busy { theme.quiet } else { theme.accent })
-            .child("Nach Updates suchen")
-            .on_click(cx.listener(|this, _, _, cx| this.start_update_check(cx))),
+    let row = div().flex().items_center().gap(space(2)).child(
+        inline_action(
+            "search-updates",
+            if busy {
+                "Prüfe…"
+            } else {
+                "Nach Updates suchen"
+            },
+            ButtonVariant::Primary,
+            theme,
+        )
+        .tab_index(32)
+        .on_click(cx.listener(|this, _, _, cx| this.start_update_check(cx))),
     );
     append_restart(row, settings, theme, cx)
 }
@@ -825,12 +1291,15 @@ fn append_restart(
             matches!(settings.update_line, UpdateLine::Ready { .. }),
             |row| {
                 row.child(
-                    div()
-                        .id("install-update")
-                        .cursor_pointer()
-                        .text_color(theme.accent)
-                        .child("Neu starten und aktualisieren")
-                        .on_click(cx.listener(|this, _, _, cx| this.restart_for_update(cx))),
+                    inline_action_with(
+                        "install-update",
+                        "Neu starten und aktualisieren",
+                        Some(icons::DOWNLOAD),
+                        ButtonVariant::Primary,
+                        theme,
+                    )
+                    .tab_index(33)
+                    .on_click(cx.listener(|this, _, _, cx| this.restart_for_update(cx))),
                 )
             },
         )
@@ -860,42 +1329,18 @@ fn autostart_row(
     theme: &FormTheme,
     cx: &mut Context<Settings>,
 ) -> impl IntoElement {
-    let label = if settings.start_with_windows {
-        "An"
-    } else {
-        "Aus"
-    };
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(6.))
-        .child(
-            field_chrome(
-                div().id("autostart-toggle"),
-                theme,
-                settings.start_with_windows,
-            )
-            .cursor_pointer()
-            .justify_between()
-            .child(autostart_label())
-            .child(
-                div()
-                    .text_color(if settings.start_with_windows {
-                        theme.accent
-                    } else {
-                        theme.quiet
-                    })
-                    .child(label),
-            )
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_autostart(cx))),
-        )
-        .when(!settings.autostart_note.is_empty(), |row| {
-            row.child(
-                div()
-                    .text_color(theme.stopped)
-                    .child(settings.autostart_note.clone()),
-            )
-        })
+    setting_row(
+        autostart_label(),
+        switch(
+            "autostart-toggle",
+            settings.start_with_windows,
+            31,
+            theme,
+            cx.listener(|this, _, _, cx| this.toggle_autostart(cx)),
+        ),
+        None,
+        theme,
+    )
 }
 
 /// Stepper for the batch size from which a summary replaces single toasts.
@@ -905,90 +1350,52 @@ fn digest_row(
     cx: &mut Context<Settings>,
 ) -> impl IntoElement {
     let threshold = settings.digest_threshold;
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(6.))
-        .child(
-            field_chrome(div(), theme, false)
-                .justify_between()
-                .gap(px(12.))
-                .child("Sammelmeldung ab")
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(12.))
-                        .child(stepper_button(
-                            "digest-less",
-                            "−",
-                            threshold > 0,
-                            theme,
-                            cx.listener(|this, _, _, cx| this.step_digest_threshold(-1, cx)),
-                        ))
-                        .child(
-                            div()
-                                .w(px(64.))
-                                .flex()
-                                .justify_center()
-                                .text_color(if threshold == 0 {
-                                    theme.quiet
-                                } else {
-                                    theme.accent
-                                })
-                                .child(if threshold == 0 {
-                                    "Aus".to_string()
-                                } else {
-                                    threshold.to_string()
-                                }),
-                        )
-                        .child(stepper_button(
-                            "digest-more",
-                            "+",
-                            threshold < MAX_DIGEST_THRESHOLD,
-                            theme,
-                            cx.listener(|this, _, _, cx| this.step_digest_threshold(1, cx)),
-                        )),
-                ),
-        )
-        .child(div().text_xs().text_color(theme.quiet).child(
-            if threshold == 0 {
-                "Jede Nachricht kommt als eigene Meldung.".to_string()
-            } else {
-                format!(
-                    "Ab {threshold} Nachrichten auf einmal kommt eine Sammelmeldung statt einzelner. Notfälle immer einzeln."
-                )
-            },
-        ))
-}
-
-fn stepper_button(
-    id: &'static str,
-    label: &'static str,
-    enabled: bool,
-    theme: &FormTheme,
-    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> gpui::Stateful<gpui::Div> {
-    let button = div()
-        .id(id)
-        .size(px(24.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
-        .text_color(if enabled {
-            theme.text
-        } else {
-            theme.placeholder
-        })
-        .child(label);
-    if enabled {
-        button.cursor_pointer().on_click(on_click)
+    let hint = if threshold == 0 {
+        "Jede Nachricht kommt als eigene Meldung.".to_string()
     } else {
-        button
-    }
+        format!(
+            "Ab {threshold} Nachrichten auf einmal kommt eine Sammelmeldung statt einzelner. Notfälle immer einzeln."
+        )
+    };
+    setting_row(
+        "Sammelmeldung ab",
+        div()
+            .flex()
+            .items_center()
+            .gap(space(2))
+            .child(icon_button(
+                "digest-less",
+                icons::MINUS,
+                threshold > 0,
+                theme,
+                cx.listener(|this, _, _, cx| this.step_digest_threshold(-1, cx)),
+            ))
+            .child(
+                div()
+                    .w(px(44.))
+                    .flex()
+                    .justify_center()
+                    .text_color(if threshold == 0 {
+                        theme.quiet
+                    } else {
+                        theme.text
+                    })
+                    .child(if threshold == 0 {
+                        "Aus".to_string()
+                    } else {
+                        threshold.to_string()
+                    }),
+            )
+            .child(icon_button(
+                "digest-more",
+                icons::PLUS,
+                threshold < MAX_DIGEST_THRESHOLD,
+                theme,
+                cx.listener(|this, _, _, cx| this.step_digest_threshold(1, cx)),
+            )),
+        Some(hint.into()),
+        theme,
+    )
 }
 
 fn volume_slider(
@@ -1000,24 +1407,17 @@ fn volume_slider(
     let view = cx.entity().downgrade();
     field_chrome(div().id("sound-volume"), theme, settings.dragging_volume)
         .cursor_pointer()
-        .gap(px(12.))
+        .gap(space(3))
         .child(
             div()
                 .flex_1()
-                .h(px(4.))
-                .rounded_md()
+                .h(px(3.))
                 .bg(theme.border)
-                .child(
-                    div()
-                        .h(px(4.))
-                        .w(relative(fraction))
-                        .rounded_md()
-                        .bg(theme.accent),
-                ),
+                .child(div().h(px(3.)).w(relative(fraction)).bg(theme.accent)),
         )
         .child(
             div()
-                .w(px(28.))
+                .w(px(32.))
                 .text_color(if settings.sound_volume == 0 {
                     theme.quiet
                 } else {
@@ -1068,23 +1468,28 @@ fn messages_pane(
     settings: &Settings,
     theme: &FormTheme,
     search_focused: bool,
+    window: &mut Window,
     cx: &mut Context<Settings>,
 ) -> gpui::Div {
     if settings.messages.is_empty() {
-        return div()
-            .text_color(theme.quiet)
-            .child("Noch keine Nachrichten.");
+        return div().child(empty_state(
+            icons::INBOX,
+            "Noch keine Nachrichten",
+            Some("Was an dieses Gerät gesendet wird, erscheint hier.".into()),
+            theme,
+        ));
     }
     let query = settings.search.read(cx).as_str().to_string();
-    let messages = matching(&newest_first(&settings.messages), &query);
+    let messages = matching(&settings.messages, &query);
     let head = div()
         .flex()
         .items_center()
-        .gap(px(12.))
-        .child(div().flex_1().child(text_field(
+        .gap(space(2))
+        .child(div().flex_1().child(field_with_icon(
             "message-search",
             settings.search.downgrade(),
             "Suchen",
+            Some(icons::SEARCH),
             theme,
             search_focused,
         )))
@@ -1094,35 +1499,52 @@ fn messages_pane(
         return div()
             .flex()
             .flex_col()
-            .gap(px(8.))
+            .gap(space(2))
             .child(head)
-            .child(div().text_color(theme.quiet).child("Kein Treffer."));
+            .child(empty_state(
+                icons::SEARCH_EMPTY,
+                "Kein Treffer",
+                Some("Kein Eintrag passt zur Suche.".into()),
+                theme,
+            ));
     }
 
     let mut list = div().id("message-list").flex().flex_col();
     for message in &messages {
         list = list.child(message_row(
             message,
-            settings.selected_id == Some(message.id),
-            settings.unread.is_fresh(message.id),
+            RowState {
+                selected: settings.selected_id == Some(message.id),
+                closing: settings.closing_id == Some(message.id),
+                fresh: settings.unread.is_fresh(message.id),
+                copied: settings.copied_id == Some(message.id),
+                measured_height: settings.row_heights.get(&message.id).copied(),
+            },
             theme,
+            window,
             cx,
         ));
     }
-    div().flex().flex_col().gap(px(8.)).child(head).child(list)
+    div()
+        .flex()
+        .flex_col()
+        .gap(space(3))
+        .child(head)
+        .child(list)
 }
 
-fn newest_first(messages: &[LoggedMessage]) -> Vec<LoggedMessage> {
-    let mut items = messages.to_vec();
-    items.sort_by(|left, right| right.time.cmp(&left.time).then(right.id.cmp(&left.id)));
-    items
+/// Sorts in place, newest first. Done once when the log changes, not per frame.
+fn sort_newest_first(messages: &mut [LoggedMessage]) {
+    messages.sort_by(|left, right| right.time.cmp(&left.time).then(right.id.cmp(&left.id)));
 }
 
-/// Case-insensitive substring over app, title, and text. An empty query keeps everything.
-fn matching(messages: &[LoggedMessage], query: &str) -> Vec<LoggedMessage> {
+/// Case-insensitive substring over app, title, and text. An empty query keeps
+/// everything. Borrows rather than clones: this runs on every frame the window
+/// draws, including each frame of a scroll.
+fn matching<'a>(messages: &'a [LoggedMessage], query: &str) -> Vec<&'a LoggedMessage> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
-        return messages.to_vec();
+        return messages.iter().collect();
     }
     messages
         .iter()
@@ -1131,17 +1553,36 @@ fn matching(messages: &[LoggedMessage], query: &str) -> Vec<LoggedMessage> {
                 || message.title.to_lowercase().contains(&needle)
                 || message.text.to_lowercase().contains(&needle)
         })
-        .cloned()
         .collect()
+}
+
+/// What one message row needs to know about itself.
+#[derive(Clone, Copy)]
+struct RowState {
+    selected: bool,
+    /// Still shrinking after a close, so its content stays mounted.
+    closing: bool,
+    /// Arrived since the window was last looked at.
+    fresh: bool,
+    copied: bool,
+    /// Open height, once measured.
+    measured_height: Option<Pixels>,
 }
 
 fn message_row(
     message: &LoggedMessage,
-    selected: bool,
-    fresh: bool,
+    state: RowState,
     theme: &FormTheme,
+    window: &mut Window,
     cx: &mut Context<Settings>,
 ) -> gpui::Div {
+    let RowState {
+        selected,
+        closing,
+        fresh,
+        copied,
+        measured_height,
+    } = state;
     let id = message.id;
     let url = message.url.clone();
     let link_label = message
@@ -1149,10 +1590,11 @@ fn message_row(
         .clone()
         .or_else(|| url.clone())
         .unwrap_or_default();
+    let ring = theme.ring;
     div()
         .flex()
-        .gap(px(10.))
-        .py(px(8.))
+        .gap(space(3))
+        .py(space(2))
         .border_b_1()
         .border_color(theme.border)
         .child(priority_stripe(message.priority, theme))
@@ -1162,25 +1604,33 @@ fn message_row(
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap(px(6.))
+                .gap(space(1))
                 .child(
                     div()
                         .id(SharedString::from(format!("msg-{id}")))
+                        .tab_stop(true)
                         .flex()
                         .items_center()
-                        .gap(px(12.))
+                        .gap(space(3))
+                        .px(space(2))
+                        .py(space(1))
+                        .mx(px(-8.))
+                        .rounded(RADIUS_MD)
                         .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.selected_id = if this.selected_id == Some(id) {
-                                None
-                            } else {
-                                Some(id)
-                            };
-                            cx.notify();
-                        }))
+                        .hover(|style| style.bg(theme.hover))
+                        .active(|style| style.bg(theme.pressed))
+                        .focus_visible(move |style| {
+                            style.ring(crate::form_theme::RING_WIDTH).ring_color(ring)
+                        })
+                        .transitions(|transitions| {
+                            transitions
+                                .bg(gpui::Motion::new(Duration::from_millis(110)))
+                                .ring(gpui::Motion::new(Duration::from_millis(110)))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_row(id, cx)))
                         .child(
                             div()
-                                .w(px(96.))
+                                .w(px(88.))
                                 .flex_shrink_0()
                                 .overflow_hidden()
                                 .whitespace_nowrap()
@@ -1200,7 +1650,7 @@ fn message_row(
                         .when(fresh, |row| {
                             row.child(
                                 div()
-                                    .size(px(6.))
+                                    .size(space(2))
                                     .flex_shrink_0()
                                     .rounded_full()
                                     .bg(theme.accent),
@@ -1214,66 +1664,218 @@ fn message_row(
                                 .child(format_local_time(message.time)),
                         ),
                 )
-                .when(selected, |row| {
-                    let body = message_body(message);
-                    let clip = copy_text(message);
-                    row.child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.))
-                            .whitespace_normal()
-                            .when(!body.is_empty(), |block| block.child(div().child(body)))
-                            .when_some(url, |block, url| {
-                                block.child(
-                                    div()
-                                        .id("message-url")
-                                        .cursor_pointer()
-                                        .underline()
-                                        .text_color(theme.accent)
-                                        .overflow_hidden()
-                                        .child(link_label)
-                                        .on_click(move |_, _, cx| {
-                                            cx.open_url(&url);
-                                        }),
-                                )
-                            })
-                            .child(row_actions(id, clip, theme, cx)),
-                    )
-                }),
+                .child(details(
+                    &Details {
+                        id,
+                        body: message_body(message),
+                        clip: copy_text(message),
+                        url,
+                        link_label,
+                        open: selected,
+                        closing,
+                        copied,
+                        measured: measured_height,
+                        theme,
+                    },
+                    window,
+                    cx,
+                )),
         )
 }
 
-/// Left edge of a row. Emergencies shout, low priority stays quiet.
-fn priority_stripe(priority: i32, theme: &FormTheme) -> gpui::Div {
-    let color = match priority {
-        2 => theme.stopped,
-        1 => theme.pending,
-        0 => theme.border,
-        _ => theme.field,
-    };
-    div().w(px(3.)).flex_shrink_0().rounded_md().bg(color)
+/// Height of the laid-out detail content, from the top of its first child to the
+/// bottom of its last, plus the padding of the box around them.
+fn content_height(children: &[Bounds<Pixels>]) -> Option<Pixels> {
+    let top = children
+        .iter()
+        .map(|bounds| bounds.top())
+        .reduce(Pixels::min)?;
+    let bottom = children
+        .iter()
+        .map(|bounds| bounds.bottom())
+        .reduce(Pixels::max)?;
+    let height = bottom - top + DETAILS_PADDING;
+    (height > px(0.)).then_some(height)
 }
 
-fn row_actions(id: u64, clip: String, theme: &FormTheme, cx: &mut Context<Settings>) -> gpui::Div {
+/// The vertical padding of the detail box, which the measurement has to add back.
+const DETAILS_PADDING: Pixels = px(12.);
+
+struct Details<'a> {
+    id: u64,
+    body: String,
+    clip: String,
+    url: Option<String>,
+    link_label: String,
+    open: bool,
+    closing: bool,
+    copied: bool,
+    measured: Option<Pixels>,
+    theme: &'a FormTheme,
+}
+
+/// The expanded half of a row. It stays in the tree whether open or not, so that
+/// its height and opacity can be transitioned in both directions.
+///
+/// A transition cannot run toward `auto`, so the open height has to be a number.
+/// The content is laid out absolutely, which keeps it measurable while the row is
+/// closed: the height is known before the first click, and it follows a rewrap
+/// when the window changes width.
+fn details(
+    details: &Details<'_>,
+    window: &mut Window,
+    cx: &mut Context<Settings>,
+) -> gpui::Stateful<gpui::Div> {
+    let Details {
+        id,
+        body,
+        clip,
+        url,
+        link_label,
+        open,
+        closing,
+        copied,
+        measured,
+        theme,
+    } = details;
+    let (id, open, closing, copied, measured) = (*id, *open, *closing, *copied, *measured);
+    let target = if open {
+        measured.unwrap_or(px(0.))
+    } else {
+        px(0.)
+    };
+    let view = cx.entity().downgrade();
+    // Only the row being opened or closed holds content. Mounting every body in
+    // the log would shape text nobody looks at, which is what made the list
+    // stutter while scrolling.
+    let mounted = open || closing;
+
+    let shell = div()
+        .id(SharedString::from(format!("details-{id}")))
+        .relative()
+        .w_full()
+        .h(target)
+        .overflow_hidden()
+        .opacity(if open { 1.0 } else { 0.0 })
+        .transitions(|transitions| {
+            transitions
+                .h(gpui::Motion::new(EXPAND_DURATION).with_easing(ease_out_quint()))
+                .opacity(gpui::Motion::new(OPACITY_DURATION).with_easing(ease_out_quint()))
+        });
+    if !mounted {
+        return shell;
+    }
+    shell.child(
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(space(2))
+            .pt(space(2))
+            .pb(space(1))
+            .whitespace_normal()
+            .when(!body.is_empty(), |block| {
+                block.child(selectable_body(id, body, theme, window, cx))
+            })
+            .when_some(url.clone(), |block, url| {
+                block.child(
+                    div()
+                        .id(SharedString::from(format!("url-{id}")))
+                        .cursor_pointer()
+                        .underline()
+                        .text_color(theme.accent)
+                        .overflow_hidden()
+                        .child(link_label.clone())
+                        .on_click(move |_, _, cx| {
+                            cx.open_url(&url);
+                        }),
+                )
+            })
+            .child(row_actions(id, clip.clone(), copied, theme, cx))
+            .on_children_prepainted(move |children, _, cx| {
+                // Measuring while closing would fight the transition it feeds.
+                if !open {
+                    return;
+                }
+                let Some(height) = content_height(&children) else {
+                    return;
+                };
+                let _ = view.update(cx, |this, cx| this.remember_height(id, height, cx));
+            }),
+    )
+}
+
+/// Left edge of a row. Emergencies shout, low priority stays quiet.
+/// Left edge of a row. Emergencies shout, low priority stays quiet.
+///
+/// The width carries the level as well as the colour, so the four steps stay
+/// apart for someone who cannot tell the colours apart.
+fn priority_stripe(priority: i32, theme: &FormTheme) -> gpui::Div {
+    let (color, width) = match priority {
+        2 => (theme.stopped, px(4.)),
+        1 => (theme.pending, px(4.)),
+        0 => (theme.border, px(2.)),
+        _ => (theme.border, px(1.)),
+    };
+    div().w(width).flex_shrink_0().bg(color)
+}
+
+fn row_actions(
+    id: u64,
+    clip: String,
+    copied: bool,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> gpui::Div {
     div()
         .flex()
         .items_center()
-        .gap(px(16.))
-        .child(copy_control(id, clip, theme, cx))
+        .gap(space(1))
+        .pt(space(1))
+        .child(copy_control(id, clip, copied, theme, cx))
         .child(
-            div()
-                .id(SharedString::from(format!("forget-{id}")))
-                .cursor_pointer()
-                .text_xs()
-                .text_color(theme.quiet)
-                .child("Löschen")
-                .on_click(cx.listener(move |this, _, _, cx| this.forget_message(id, cx))),
+            inline_action_with(
+                SharedString::from(format!("forget-{id}")),
+                "Löschen",
+                Some(icons::TRASH),
+                ButtonVariant::Danger,
+                theme,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.forget_message(id, cx))),
         )
 }
 
 fn message_body(message: &LoggedMessage) -> String {
     message.text.clone()
+}
+
+/// The body as a read-only editor, so the text can be selected and copied by hand.
+/// `use_keyed_init` seeds it once; a later edit of the same message never happens
+/// because the log is append-only.
+fn selectable_body(
+    id: u64,
+    body: &str,
+    theme: &FormTheme,
+    window: &mut Window,
+    cx: &mut Context<Settings>,
+) -> impl IntoElement {
+    let element_id = SharedString::from(format!("body-{id}"));
+    let seed = body.to_string();
+    let state = EditableTextState::use_keyed_init(element_id.clone(), window, cx, move |_, _| {
+        StringStorage::from(seed.as_str())
+    });
+    text_area(element_id)
+        .state(state.downgrade())
+        .accepts_input(false)
+        .w_full()
+        .cursor_text()
+        .text_sm()
+        .text_color(theme.text)
+        .selection_color(theme.selection)
+        .caret_w(px(0.))
 }
 
 /// What the clipboard gets: title, text, and the link, each on its own line.
@@ -1294,24 +1896,64 @@ fn copy_text(message: &LoggedMessage) -> String {
     lines.join("\n")
 }
 
-fn copy_control(id: u64, text: String, theme: &FormTheme, cx: &mut Context<Settings>) -> gpui::Div {
+/// "Kopieren", which confirms itself where the click happened rather than only
+/// in the toast area.
+fn copy_control(
+    id: u64,
+    text: String,
+    copied: bool,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> gpui::Div {
     if text.is_empty() {
         return div();
     }
+    if copied {
+        return div().child(
+            div()
+                .h(crate::form_theme::CONTROL_HEIGHT_SM)
+                .px(space(2))
+                .flex()
+                .items_center()
+                .text_xs()
+                .gap(space(1))
+                .text_color(theme.connected)
+                .child(crate::icons::icon(icons::CHECK, px(12.), theme.connected))
+                .child("Kopiert")
+                .with_animation(
+                    SharedString::from(format!("copied-{id}")),
+                    Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
+                    |label, delta| label.opacity(0.4 + 0.6 * delta),
+                ),
+        );
+    }
     div().child(
-        div()
-            .id(SharedString::from(format!("copy-{id}")))
-            .cursor_pointer()
-            .text_xs()
-            .text_color(theme.accent)
-            .child("Kopieren")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
-                this.set_status("In die Zwischenablage kopiert.", cx);
-            })),
+        inline_action_with(
+            SharedString::from(format!("copy-{id}")),
+            "Kopieren",
+            Some(icons::COPY),
+            ButtonVariant::Primary,
+            theme,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+            this.mark_copied(id, cx);
+        })),
     )
 }
 
+/// The unacknowledged emergency, waiting for the user.
+///
+/// One accent edge on the left carries the urgency; the rest of the card is the
+/// same neutral surface as everything else. An outline all the way around reads
+/// as an error state of the whole window rather than as one item needing an
+/// answer.
+/// The unacknowledged emergency, waiting for the user.
+///
+/// One accent edge on the left carries the urgency; the rest of the card is the
+/// same neutral surface as everything else. The edge is a square element rather
+/// than a left border, because a border follows the card's corner radius and
+/// ends up rounded at top and bottom.
 fn emergency_card(
     title: String,
     theme: &FormTheme,
@@ -1319,105 +1961,151 @@ fn emergency_card(
 ) -> impl IntoElement {
     div()
         .flex()
-        .flex_col()
-        .gap(px(12.))
-        .p(px(12.))
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.field)
-        .child(div().child(title))
+        .items_stretch()
+        .overflow_hidden()
+        .rounded(RADIUS_MD)
+        .bg(theme.raised)
+        .child(div().w(px(3.)).flex_shrink_0().bg(theme.stopped))
         .child(
-            primary_button("ack-emergency", "Notfall bestätigen", theme)
-                .on_click(cx.listener(|this, _, _, cx| this.acknowledge(cx))),
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(space(4))
+                .pl(space(4))
+                .pr(space(3))
+                .py(space(3))
+                .child(crate::icons::icon(
+                    icons::EMERGENCY,
+                    crate::icons::icon_size(),
+                    theme.stopped,
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.quiet)
+                                .child("Notfall – Bestätigung nötig"),
+                        )
+                        .child(
+                            div()
+                                .whitespace_normal()
+                                .text_color(theme.text)
+                                .child(title),
+                        ),
+                )
+                .child(
+                    button(
+                        "ack-emergency",
+                        "Bestätigen",
+                        ButtonVariant::Secondary,
+                        theme,
+                    )
+                    .tab_index(5)
+                    .on_click(cx.listener(|this, _, _, cx| this.acknowledge(cx))),
+                ),
         )
 }
 
+/// "Leeren", which asks before it empties the log.
 fn clear_control(confirm: bool, theme: &FormTheme, cx: &mut Context<Settings>) -> gpui::Div {
     if !confirm {
-        return div().flex().justify_end().child(
-            div()
-                .id("clear-messages")
-                .cursor_pointer()
-                .text_xs()
-                .text_color(theme.accent)
-                .child("Leeren")
-                .on_click(cx.listener(|this, _, _, cx| this.ask_clear(cx))),
+        return div().child(
+            inline_action_with(
+                "clear-messages",
+                "Leeren",
+                Some(icons::TRASH),
+                ButtonVariant::Danger,
+                theme,
+            )
+            .tab_index(41)
+            .on_click(cx.listener(|this, _, _, cx| this.ask_clear(cx))),
         );
     }
 
-    div().flex().justify_end().child(
-        div()
-            .flex()
-            .items_center()
-            .gap(px(12.))
-            .h(field_height())
-            .px_3()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.field)
-            .child("Wirklich leeren?")
-            .child(
-                div()
-                    .id("confirm-clear")
-                    .cursor_pointer()
-                    .text_color(theme.accent)
-                    .child("Leeren")
-                    .on_click(cx.listener(|this, _, _, cx| this.clear_messages(cx))),
-            )
-            .child(
-                div()
-                    .id("cancel-clear")
-                    .cursor_pointer()
-                    .text_color(theme.quiet)
-                    .child("Abbrechen")
-                    .on_click(cx.listener(|this, _, _, cx| this.cancel_clear(cx))),
-            ),
-    )
+    div()
+        .flex()
+        .items_center()
+        .gap(space(2))
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.quiet)
+                .child("Wirklich leeren?"),
+        )
+        .child(
+            inline_action("confirm-clear", "Ja, leeren", ButtonVariant::Danger, theme)
+                .tab_index(42)
+                .on_click(cx.listener(|this, _, _, cx| this.clear_messages(cx))),
+        )
+        .child(
+            inline_action("cancel-clear", "Abbrechen", ButtonVariant::Ghost, theme)
+                .tab_index(43)
+                .on_click(cx.listener(|this, _, _, cx| this.cancel_clear(cx))),
+        )
 }
 
-fn connection_dot(connection: Connection, theme: &FormTheme) -> impl IntoElement {
-    let color = match connection {
-        Connection::Connected => theme.connected,
-        Connection::Connecting | Connection::Reconnecting => theme.pending,
-        Connection::SignedOut | Connection::SyncFailed | Connection::SessionEnded => theme.stopped,
+/// Pulses only while the connection is still coming up. A repeating animation
+/// redraws the whole view on every one of its frames, so a settled connection
+/// gets a still dot instead of a permanent 30 fps relayout of the message list.
+fn connection_dot(connection: Connection, theme: &FormTheme) -> gpui::AnyElement {
+    let (color, pulsing) = match connection {
+        Connection::Connected => (theme.connected, false),
+        Connection::Connecting | Connection::Reconnecting => (theme.pending, true),
+        Connection::SignedOut | Connection::SyncFailed | Connection::SessionEnded => {
+            (theme.stopped, false)
+        }
     };
-    div()
-        .size(px(8.))
+    let dot = div()
+        .size(space(2))
         .flex_shrink_0()
         .rounded_full()
-        .bg(color)
-        .with_animation(
-            "connection-pulse",
-            Animation::new(Duration::from_millis(1600))
-                .repeat()
-                .with_easing(pulsating_between(0.35, 1.0))
-                .with_max_fps(30.),
-            |dot, opacity| dot.opacity(opacity),
-        )
+        .bg(color);
+    if !pulsing {
+        return dot.into_any_element();
+    }
+    dot.with_animation(
+        "connection-pulse",
+        Animation::new(Duration::from_millis(1600))
+            .repeat()
+            .with_easing(pulsating_between(0.35, 1.0))
+            .with_max_fps(30.),
+        |dot, opacity| dot.opacity(opacity),
+    )
+    .into_any_element()
 }
 
 fn top_bar(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settings>) -> impl IntoElement {
     div()
         .flex()
-        .items_end()
-        .gap(px(16.))
-        .h(px(44.))
-        .px(px(20.))
+        .items_center()
+        .gap(space(2))
+        .h(px(52.))
+        .px(space(5))
+        .flex_shrink_0()
         .border_b_1()
         .border_color(theme.border)
         .child(
             div()
-                .pb(px(8.))
+                .pr(space(2))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text)
                 .child("Openover"),
         )
         .child(
-            tab_button(
+            tab(
                 "tab-messages",
                 "Nachrichten",
+                icons::INBOX,
                 settings.pane == Pane::Messages,
+                1,
                 theme,
             )
             .on_click(cx.listener(|this, _, _, cx| {
@@ -1427,10 +2115,12 @@ fn top_bar(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settings>) -
             })),
         )
         .child(
-            tab_button(
+            tab(
                 "tab-account",
                 "Konto",
+                icons::ACCOUNT,
                 settings.pane == Pane::Account,
+                2,
                 theme,
             )
             .on_click(cx.listener(|this, _, _, cx| {
@@ -1439,10 +2129,12 @@ fn top_bar(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settings>) -
             })),
         )
         .child(
-            tab_button(
+            tab(
                 "tab-preferences",
                 "Einstellungen",
+                icons::SETTINGS,
                 settings.pane == Pane::Preferences,
+                3,
                 theme,
             )
             .on_click(cx.listener(|this, _, _, cx| {
@@ -1455,8 +2147,8 @@ fn top_bar(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settings>) -
             div()
                 .flex()
                 .items_center()
-                .gap(px(8.))
-                .pb(px(8.))
+                .gap(space(2))
+                .text_xs()
                 .text_color(theme.quiet)
                 .child(connection_dot(settings.connection, theme))
                 .child(settings.connection.label()),
@@ -1466,68 +2158,22 @@ fn top_bar(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settings>) -
 fn account_links(theme: &FormTheme) -> impl IntoElement {
     div()
         .flex()
-        .flex_col()
-        .gap(px(6.))
-        .pt(px(8.))
-        .text_color(theme.quiet)
-        .child(
-            div()
-                .id("open-pushover")
-                .cursor_pointer()
-                .child("pushover.net")
-                .on_click(|_, _, cx| cx.open_url("https://pushover.net/clients/desktop")),
-        )
-        .child(
-            div()
-                .id("open-signup")
-                .cursor_pointer()
-                .child("pushover.net/signup")
-                .on_click(|_, _, cx| cx.open_url("https://pushover.net/signup")),
-        )
-}
-
-fn tab_button(
-    id: &'static str,
-    label: &'static str,
-    active: bool,
-    theme: &FormTheme,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .cursor_pointer()
-        .pb(px(6.))
-        .border_b(px(2.))
-        .border_color(if active { theme.accent } else { theme.border })
-        .text_color(if active { theme.accent } else { theme.quiet })
-        .child(label)
-}
-
-fn primary_button(
-    id: &'static str,
-    label: &'static str,
-    theme: &FormTheme,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .w_full()
-        .h(field_height())
-        .flex()
         .items_center()
-        .justify_center()
-        .rounded_md()
-        .bg(theme.accent)
-        .text_color(theme.on_accent)
-        .cursor_pointer()
-        .child(label)
-}
-
-fn labeled(label: &'static str, field: impl IntoElement) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(6.))
-        .child(div().child(label))
-        .child(field)
+        .gap(space(2))
+        .pt(space(2))
+        .child(link(
+            "open-pushover",
+            "pushover.net",
+            "https://pushover.net/clients/desktop",
+            theme,
+        ))
+        .child(div().text_color(theme.border).child("·"))
+        .child(link(
+            "open-signup",
+            "Konto anlegen",
+            "https://pushover.net/signup",
+            theme,
+        ))
 }
 
 fn text_field(
@@ -1537,17 +2183,38 @@ fn text_field(
     theme: &FormTheme,
     focused: bool,
 ) -> impl IntoElement + use<> {
-    field_chrome(div(), theme, focused).child(
-        text_input(id)
-            .state(state)
-            .placeholder(placeholder)
-            .placeholder_color(theme.placeholder)
-            .caret_color(rgb_to_hsla(theme.text))
-            .selection_color(theme.selection)
-            .w_full()
-            .whitespace_nowrap()
-            .overflow_x_scroll(),
-    )
+    field_with_icon(id, state, placeholder, None, theme, focused)
+}
+
+/// A text field with a leading icon, for a search box.
+fn field_with_icon(
+    id: &'static str,
+    state: gpui::WeakEntity<EditableTextState>,
+    placeholder: &'static str,
+    glyph: Option<&'static [u8]>,
+    theme: &FormTheme,
+    focused: bool,
+) -> impl IntoElement + use<> {
+    field_chrome(div(), theme, focused)
+        .gap(space(2))
+        .when_some(glyph, |field, glyph| {
+            field.child(crate::icons::icon(
+                glyph,
+                crate::icons::icon_size_sm(),
+                theme.placeholder,
+            ))
+        })
+        .child(
+            text_input(id)
+                .state(state)
+                .placeholder(placeholder)
+                .placeholder_color(theme.placeholder)
+                .caret_color(rgb_to_hsla(theme.text))
+                .selection_color(theme.selection)
+                .w_full()
+                .whitespace_nowrap()
+                .overflow_x_scroll(),
+        )
 }
 
 fn show_toast(cx: &mut App, toast: &Toast, sound_enabled: bool, sound_volume: u8) {
@@ -1653,6 +2320,106 @@ fn settings_entity(cx: &mut App) -> Entity<Settings> {
     entity
 }
 
+/// Walks through every kind of feedback the window can show, one after another.
+///
+/// It drives the real code paths - the same `Toast` struct the sync produces and
+/// the same notice area the app uses - so what you see here is what a real
+/// message looks like, not a mock-up of one.
+pub fn demo(cx: &mut App) {
+    let view = settings_entity(cx);
+    view.update(cx, |this, cx| {
+        this.pane = Pane::Messages;
+        cx.notify();
+    });
+    open_settings_window(cx);
+
+    let steps: Vec<(u64, DemoStep)> = vec![
+        (500, DemoStep::Notice("Demo läuft: jede Rückmeldung einmal.".into(), MessageKind::Info)),
+        (2500, DemoStep::SystemToast(demo_toast(1, 0, "Backup abgeschlossen", "Alle 4 Volumes gesichert, keine Fehler.", None))),
+        (5000, DemoStep::Notice("In die Zwischenablage kopiert.".into(), MessageKind::Success)),
+        (7500, DemoStep::SystemToast(demo_toast(2, 1, "Zertifikat läuft ab", "example.com läuft in 7 Tagen ab.", None))),
+        (10000, DemoStep::Notice("3 neue Nachrichten.".into(), MessageKind::Info)),
+        (12500, DemoStep::SystemToast(demo_toast(3, 2, "Server antwortet nicht", "db-01 ist seit 2 Minuten offline.", Some("demo-receipt")))),
+        (15000, DemoStep::Notice("Anmeldung fehlgeschlagen: Passwort falsch.".into(), MessageKind::Error)),
+        (18000, DemoStep::Notice(
+            "Bestätigung fehlgeschlagen: Der Server hat die Anfrage mit HTTP 503 abgelehnt. Die Quittung bleibt offen und wird beim nächsten Verbindungsaufbau erneut gesendet. Falls der Notfall bereits auf einem anderen Gerät bestätigt wurde, verschwindet er hier von selbst, sobald die Synchronisation durchgelaufen ist.".into(),
+            MessageKind::Error,
+        )),
+        (24000, DemoStep::Digest),
+        (27000, DemoStep::Notice("Demo zu Ende.".into(), MessageKind::Success)),
+    ];
+
+    for (delay, step) in steps {
+        cx.spawn(async move |cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(delay))
+                .await;
+            cx.update(|cx| run_demo_step(step, cx));
+        })
+        .detach();
+    }
+}
+
+enum DemoStep {
+    /// A line in the window's notice area.
+    Notice(SharedString, MessageKind),
+    /// A real Windows toast, built from the same struct the sync produces.
+    SystemToast(Toast),
+    /// The summary that replaces single toasts for a large batch.
+    Digest,
+}
+
+fn run_demo_step(step: DemoStep, cx: &mut App) {
+    match step {
+        DemoStep::Notice(text, kind) => {
+            let view = settings_entity(cx);
+            view.update(cx, |this, cx| this.notify_user(text, kind, cx));
+        }
+        DemoStep::SystemToast(toast) => {
+            let view = settings_entity(cx);
+            let (sound_enabled, volume) = {
+                let settings = view.read(cx);
+                (settings.sound_enabled, settings.sound_volume)
+            };
+            show_toast(cx, &toast, sound_enabled, volume);
+            if let Some(receipt) = toast.receipt.clone() {
+                view.update(cx, |this, cx| {
+                    this.pending_emergency = Some((receipt, toast.title.clone()));
+                    cx.notify();
+                });
+            }
+        }
+        DemoStep::Digest => {
+            let toasts: Vec<Toast> = (10..15)
+                .map(|id| demo_toast(id, 0, "Sammelmeldung", "Eine von mehreren.", None))
+                .collect();
+            let view = settings_entity(cx);
+            let (sound_enabled, volume) = {
+                let settings = view.read(cx);
+                (settings.sound_enabled, settings.sound_volume)
+            };
+            show_digest(cx, &toasts, sound_enabled, volume);
+            let count = toasts.len();
+            view.update(cx, |this, cx| {
+                this.notify_user(format!("{count} neue Nachrichten."), MessageKind::Info, cx)
+            });
+        }
+    }
+}
+
+fn demo_toast(id: u64, priority: i32, title: &str, body: &str, receipt: Option<&str>) -> Toast {
+    Toast {
+        message_id: id,
+        title: title.to_string(),
+        body: body.to_string(),
+        app: "Demo".to_string(),
+        priority,
+        receipt: receipt.map(str::to_string),
+        sound: None,
+        sound_path: None,
+    }
+}
+
 pub fn install(cx: &mut App, background: bool) {
     cx.bind_keys(default_bindings().as_keybindings(Some(DEFAULT_INPUT_CONTEXT)));
 
@@ -1667,7 +2434,7 @@ pub fn install(cx: &mut App, background: bool) {
             this.logged_in = true;
             this.connection = Connection::Connecting;
             this.pane = Pane::Messages;
-            this.status = SharedString::default();
+            this.notice = None;
             cx.notify();
         });
         crate::tray::set_tooltip_text(cx, Connection::Connecting.tooltip());
@@ -1943,5 +2710,41 @@ mod tests {
         assert_eq!(super::matching(&rows, "fehler")[0].id, 1);
         assert_eq!(super::matching(&rows, "grafana")[0].id, 2);
         assert!(super::matching(&rows, "nichts").is_empty());
+    }
+
+    #[test]
+    fn newest_comes_first_whatever_order_the_log_was_in() {
+        let mut older = logged("alt", "", None);
+        older.id = 1;
+        older.time = 100;
+        let mut newer = logged("neu", "", None);
+        newer.id = 2;
+        newer.time = 200;
+        let mut rows = vec![older, newer];
+        super::sort_newest_first(&mut rows);
+        assert_eq!(rows[0].id, 2);
+        assert_eq!(rows[1].id, 1);
+    }
+
+    #[test]
+    fn an_error_stays_on_screen_longer_than_a_confirmation() {
+        // An error usually asks the user to do something, so it must not vanish
+        // while they are still reading it.
+        assert!(super::NOTICE_LIFE_LONG > super::NOTICE_LIFE);
+        assert!(super::NOTICE_LIFE > super::COPIED_FEEDBACK);
+    }
+
+    #[test]
+    fn a_field_error_only_shows_at_its_own_field() {
+        let error = Some((super::Field::Email, gpui::SharedString::from("leer")));
+        let shown = |field: super::Field| {
+            error
+                .as_ref()
+                .filter(|(which, _)| *which == field)
+                .map(|(_, text)| text.clone())
+        };
+        assert_eq!(shown(super::Field::Email).as_deref(), Some("leer"));
+        assert!(shown(super::Field::Password).is_none());
+        assert!(shown(super::Field::DeviceName).is_none());
     }
 }

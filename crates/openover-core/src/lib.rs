@@ -23,7 +23,9 @@ pub use health::{
     CONNECT_STUCK_AFTER, FetchHealth, LiveSocket, SESSION_HEALTH_EVERY, SocketHealth,
     classify_connecting, classify_socket, fetch_health, health_check_due, health_needs_reconnect,
 };
-pub use local_state::{LocalState, PendingEmergency, clamp_volume, default_state_path};
+pub use local_state::{
+    LocalState, PendingEmergency, ThemeChoice, clamp_volume, default_state_path,
+};
 pub use message_log::{
     LoggedMessage, MESSAGE_LOG_LIMIT, append_message_log, clear_message_log, entries_for_toasts,
     forget_message, load_message_log, messages_path,
