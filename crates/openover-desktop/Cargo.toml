@@ -28,7 +28,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [dev-dependencies]
 # Only to prove the inlined icons rasterize to visible pixels; GPUI draws them
 # as an alpha mask, and a stroke-only SVG that produces none is invisible.
-resvg = "0.45"
+resvg = "0.48"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Foundation", "UI_Notifications", "Data_Xml_Dom", "Win32_UI_WindowsAndMessaging", "Win32_System_Power", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
