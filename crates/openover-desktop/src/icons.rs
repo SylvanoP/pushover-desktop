@@ -132,6 +132,42 @@ lucide!(
 );
 
 lucide!(
+    CHEVRON_DOWN,
+    "a menu that opens",
+    r##"<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m6 9l6 6l6-6"/>"##
+);
+
+lucide!(
+    PLAY,
+    "listening to a sound",
+    r##"<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"/>"##
+);
+
+lucide!(
+    STOP,
+    "stopping a sound that plays",
+    r##"<rect width="14" height="14" x="5" y="5" fill="currentColor" rx="2"/>"##
+);
+
+lucide!(
+    RETRY,
+    "trying a failed action again",
+    r##"<g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9a9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></g>"##
+);
+
+lucide!(
+    FOLDER,
+    "opening a folder",
+    r##"<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>"##
+);
+
+lucide!(
+    LOADER,
+    "work that is still running",
+    r##"<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 1 1-6.219-8.56"/>"##
+);
+
+lucide!(
     CLOSE,
     "dismissing the notice",
     r##"<path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18 6L6 18M6 6l12 12"/>"##

@@ -2,8 +2,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ApiError {
+    /// The URL is stripped on the way in: the message fetch carries the session
+    /// secret in its query string, and this error ends up in the log file.
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
     #[error("two-factor authentication required (HTTP 412)")]
     TwoFactorRequired,
     #[error("login failed: {detail}")]
@@ -28,6 +30,12 @@ pub enum ApiError {
     DeviceName(#[from] crate::device_name::DeviceNameError),
     #[error("invalid JSON response: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+impl From<reqwest::Error> for ApiError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::Http(err.without_url())
+    }
 }
 
 #[derive(Debug, Error)]

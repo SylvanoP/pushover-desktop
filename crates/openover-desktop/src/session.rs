@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use futures_channel::mpsc::UnboundedSender;
 use openover_core::{
-    ApiError, CredentialStore, FetchHealth, LiveSocket, LocalState, PendingEmergency, PushLoop,
-    PushLoopEvent, PushoverClient, SESSION_HEALTH_EVERY, SocketHealth, StoredCredentials, Toast,
-    append_message_log, clamp_digest_threshold, clamp_volume, classify_socket, cursor_after_delete,
-    entries_for_toasts, fetch_health, health_check_due, health_needs_reconnect, load_message_log,
-    plan_sync, split_for_delivery, wipe_secret, without_known_ids,
+    ApiError, CredentialStore, FetchHealth, LiveSocket, LocalState, PendingEmergency,
+    PriorityRules, PushLoop, PushLoopEvent, PushoverClient, QuietHours, SESSION_HEALTH_EVERY,
+    SocketHealth, StoredCredentials, Toast, append_message_log, clamp_digest_threshold,
+    clamp_volume, classify_socket, cursor_after_delete, entries_for_toasts, fetch_health,
+    health_check_due, health_needs_reconnect, load_message_log, plan_sync, split_for_delivery,
+    wipe_secret, without_known_ids,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -33,6 +34,12 @@ pub enum SessionCommand {
     },
     SetDigestThreshold {
         threshold: u8,
+    },
+    SetPriorityRules {
+        rules: PriorityRules,
+    },
+    SetQuietHours {
+        quiet: QuietHours,
     },
     OpenMessage {
         id: u64,
@@ -106,6 +113,11 @@ pub enum SessionEvent {
     SessionLost {
         epoch: u64,
         message: String,
+    },
+    /// Messages were logged without a notification, because their priority is
+    /// muted. The list has to show them all the same.
+    LogChanged {
+        epoch: u64,
     },
     Activate,
     OpenMessage {
@@ -200,6 +212,8 @@ async fn session_main(
             SessionCommand::Acknowledge { receipt } => live.acknowledge(&receipt).await,
             SessionCommand::Logout => live.logout().await,
             SessionCommand::SetSound { enabled, volume } => live.set_sound(enabled, volume),
+            SessionCommand::SetPriorityRules { rules } => live.set_priority_rules(rules),
+            SessionCommand::SetQuietHours { quiet } => live.set_quiet_hours(quiet),
             SessionCommand::SetDigestThreshold { threshold } => {
                 live.set_digest_threshold(threshold)
             }
@@ -374,6 +388,22 @@ impl Live {
         state.sound_volume = clamp_volume(volume);
         if let Err(err) = state.save() {
             tracing::warn!("could not store sound setting: {err}");
+        }
+    }
+
+    fn set_quiet_hours(&self, quiet: QuietHours) {
+        let mut state = lock_state(&self.state);
+        state.quiet = quiet.normalized();
+        if let Err(err) = state.save() {
+            tracing::warn!("could not store quiet hours: {err}");
+        }
+    }
+
+    fn set_priority_rules(&self, rules: PriorityRules) {
+        let mut state = lock_state(&self.state);
+        state.priority_rules = rules.normalized();
+        if let Err(err) = state.save() {
+            tracing::warn!("could not store priority rules: {err}");
         }
     }
 
@@ -585,7 +615,8 @@ async fn run_push(push: PushRun) {
                 }
                 let pending = lock_state(&state).emergencies.clone();
                 for emergency in pending {
-                    let mut toast = emergency_toast(&emergency);
+                    let rules = lock_state(&state).priority_rules.clone();
+                    let mut toast = rules.apply_sound(emergency_toast(&emergency));
                     toast = with_sound(&client, toast).await;
                     if !still_current(&flag, epoch) {
                         break;
@@ -718,8 +749,26 @@ async fn sync_messages(
         }
     }
 
-    let threshold = lock_state(state).digest_threshold;
-    let delivery = split_for_delivery(toasts, threshold);
+    // Muted priorities stay in the log above but never reach the screen, and
+    // do not count towards the bundle either.
+    let (threshold, rules, quiet) = {
+        let current = lock_state(state);
+        (
+            current.digest_threshold,
+            current.priority_rules.clone(),
+            current.quiet.clone(),
+        )
+    };
+    let toast_count = toasts.len();
+    let shaped = quiet.shape(
+        rules.shape(toasts),
+        crate::clock::unix_now(),
+        crate::clock::minute_of_day_now(),
+    );
+    if shaped.len() < toast_count && still_current(flag, epoch) {
+        send(events, SessionEvent::LogChanged { epoch });
+    }
+    let delivery = split_for_delivery(shaped, threshold);
 
     for toast in delivery.single {
         if !still_current(flag, epoch) {

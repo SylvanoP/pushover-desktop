@@ -14,6 +14,9 @@ pub const WINDOWS_ASSET: &str = "openover-desktop-windows-x64.exe";
 pub struct ReleaseAsset {
     pub version: String,
     pub url: String,
+    /// Hex SHA-256 GitHub publishes for the asset. A download that does not
+    /// match it is thrown away rather than installed.
+    pub sha256: Option<String>,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -64,22 +67,27 @@ pub fn parse_latest_release(body: &str) -> Result<ReleaseAsset, &'static str> {
         .get("assets")
         .and_then(|assets| assets.as_array())
         .ok_or("Release unlesbar")?;
-    let url = assets
+    let asset = assets
         .iter()
-        .find_map(|asset| {
-            let name = asset.get("name")?.as_str()?;
-            if name != WINDOWS_ASSET {
-                return None;
-            }
-            asset.get("browser_download_url")?.as_str()
-        })
+        .find(|asset| asset.get("name").and_then(|name| name.as_str()) == Some(WINDOWS_ASSET))
         .ok_or("Kein Windows-Build")?;
+    let url = asset
+        .get("browser_download_url")
+        .and_then(|url| url.as_str())
+        .ok_or("Kein Windows-Build")?;
+    let sha256 = asset
+        .get("digest")
+        .and_then(|digest| digest.as_str())
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .filter(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase);
     if !url.starts_with("https://") {
         return Err("Kein Windows-Build");
     }
     Ok(ReleaseAsset {
         version: version.to_string(),
         url: url.to_string(),
+        sha256,
     })
 }
 
@@ -122,13 +130,86 @@ async fn store_newer_release(release: ReleaseAsset) -> CheckOutcome {
         Ok(dest) => dest,
         Err(message) => return CheckOutcome::Failed(message),
     };
-    match download_to(&release.url, &dest).await {
-        Ok(()) => CheckOutcome::Ready {
+    if staged_version_matches(&dest, &release) {
+        return CheckOutcome::Ready {
             version: release.version,
             path: dest,
-        },
+        };
+    }
+    match download_to(&release.url, release.sha256.as_deref(), &dest).await {
+        Ok(()) => {
+            remember_staged(&dest, &release.version);
+            CheckOutcome::Ready {
+                version: release.version,
+                path: dest,
+            }
+        }
         Err(message) => CheckOutcome::Failed(message),
     }
+}
+
+/// The file next to a staged download that says which version it is.
+#[cfg(windows)]
+fn version_marker(dest: &Path) -> PathBuf {
+    dest.with_extension("version")
+}
+
+#[cfg(windows)]
+fn remember_staged(dest: &Path, version: &str) {
+    if let Err(err) = std::fs::write(version_marker(dest), version) {
+        tracing::warn!("could not note the staged update version: {err}");
+    }
+}
+
+/// A download from an earlier check is reused when it is the same version and
+/// still matches the published hash, so a restart does not fetch it again.
+#[cfg(windows)]
+fn staged_version_matches(dest: &Path, release: &ReleaseAsset) -> bool {
+    let Ok(version) = std::fs::read_to_string(version_marker(dest)) else {
+        return false;
+    };
+    if version.trim() != release.version {
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(dest) else {
+        return false;
+    };
+    release
+        .sha256
+        .as_deref()
+        .is_none_or(|expected| sha256_hex(&bytes) == expected)
+}
+
+/// The version of an update that is downloaded and ready, when it is newer
+/// than this build. Read at start, so a pending update installs itself.
+#[cfg(windows)]
+pub fn staged_update() -> Option<(String, PathBuf)> {
+    let dest = windows_asset_path().ok()?;
+    let version = std::fs::read_to_string(version_marker(&dest)).ok()?;
+    let version = version.trim().to_string();
+    (dest.is_file() && is_newer(env!("CARGO_PKG_VERSION"), &version)).then_some((version, dest))
+}
+
+/// Removes a staged download that is not newer than this build, so an old
+/// file never lingers in the updates folder.
+#[cfg(windows)]
+pub fn discard_stale_download() {
+    let Ok(dest) = windows_asset_path() else {
+        return;
+    };
+    if staged_update().is_none() {
+        let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(version_marker(&dest));
+    }
+}
+
+#[cfg(windows)]
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -163,6 +244,10 @@ async fn fetch_latest() -> Result<String, String> {
         .map_err(|_| "Release unlesbar".to_string())
 }
 
+/// Anything smaller cannot be the app and is a truncated or wrong download.
+#[cfg(windows)]
+const MIN_EXE_BYTES: usize = 64 * 1024;
+
 #[cfg(windows)]
 fn windows_asset_path() -> Result<PathBuf, String> {
     let appdata = std::env::var_os("APPDATA").ok_or("Kein AppData")?;
@@ -173,7 +258,7 @@ fn windows_asset_path() -> Result<PathBuf, String> {
 }
 
 #[cfg(windows)]
-async fn download_to(url: &str, dest: &Path) -> Result<(), String> {
+async fn download_to(url: &str, sha256: Option<&str>, dest: &Path) -> Result<(), String> {
     if !url.starts_with("https://") {
         return Err("Download-Adresse ungültig".into());
     }
@@ -189,8 +274,14 @@ async fn download_to(url: &str, dest: &Path) -> Result<(), String> {
         .bytes()
         .await
         .map_err(|_| "Download unvollständig".to_string())?;
-    if bytes.len() < 64 * 1024 {
+    if bytes.len() < MIN_EXE_BYTES {
         return Err("Download unvollständig".into());
+    }
+    if let Some(expected) = sha256
+        && sha256_hex(&bytes) != expected
+    {
+        tracing::warn!("update download did not match the published SHA-256");
+        return Err("Download beschädigt, Prüfsumme stimmt nicht".into());
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|_| "Update-Ordner fehlt".to_string())?;
@@ -338,6 +429,33 @@ mod tests {
         }"#;
         assert!(offer_for("0.1.2", body).is_none());
         assert!(offer_for("0.1.0", body).is_some());
+    }
+
+    #[test]
+    fn release_json_reads_the_asset_digest() {
+        let body = r#"{
+            "tag_name": "v0.2.0",
+            "assets": [{
+                "name": "openover-desktop-windows-x64.exe",
+                "browser_download_url": "https://github.com/x/y/releases/download/v0.2.0/openover-desktop-windows-x64.exe",
+                "digest": "sha256:23750E516B19B9A34603BE0289A8106CF9220B30EF2D23E409B903D17A76DFC2"
+            }]
+        }"#;
+        assert_eq!(
+            parse_latest_release(body).unwrap().sha256.as_deref(),
+            Some("23750e516b19b9a34603be0289a8106cf9220b30ef2d23e409b903d17a76dfc2")
+        );
+        let broken = body.replace("sha256:2375", "md5:2375");
+        assert_eq!(parse_latest_release(&broken).unwrap().sha256, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sha256_matches_a_known_vector() {
+        assert_eq!(
+            super::sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
