@@ -163,7 +163,7 @@ impl Playing {
 }
 
 fn worker(rx: Receiver<Command>) {
-    let mut player = playback::Player::default();
+    let mut player = playback::Player::new();
     let mut current: Option<Playing> = None;
     loop {
         let command = if current.is_some() {
@@ -242,12 +242,15 @@ mod playback {
 
     /// The MCI device behind the alias `oo`. Opened per sound and closed again,
     /// so the file is never held open between sounds.
-    #[derive(Default)]
     pub struct Player {
         open: bool,
     }
 
     impl Player {
+        pub fn new() -> Self {
+            Self { open: false }
+        }
+
         pub fn start(&mut self, path: &Path, volume: u8) -> Result<(), String> {
             self.halt();
             open(path, volume).map_err(|code| format!("mci {code}"))?;
@@ -340,12 +343,15 @@ mod playback {
     use std::process::{Child, Command};
 
     /// One `afplay` process per sound. Stopping kills it.
-    #[derive(Default)]
     pub struct Player {
         child: Option<Child>,
     }
 
     impl Player {
+        pub fn new() -> Self {
+            Self { child: None }
+        }
+
         pub fn start(&mut self, path: &Path, volume: u8) -> Result<(), String> {
             self.halt();
             let child = Command::new("afplay")
@@ -388,10 +394,13 @@ mod playback {
 mod playback {
     use std::path::{Path, PathBuf};
 
-    #[derive(Default)]
     pub struct Player;
 
     impl Player {
+        pub fn new() -> Self {
+            Self
+        }
+
         pub fn start(&mut self, _path: &Path, _volume: u8) -> Result<(), String> {
             Err("sound playback is implemented on Windows and macOS".into())
         }
