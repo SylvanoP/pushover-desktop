@@ -8,6 +8,40 @@ use std::path::PathBuf;
 
 pub const DEFAULT_SOUND: &str = "pushover";
 
+/// Every sound Pushover offers, by code and the name its own apps show.
+pub const PUSHOVER_SOUNDS: [(&str, &str); 21] = [
+    ("pushover", "Pushover"),
+    ("bike", "Bike"),
+    ("bugle", "Bugle"),
+    ("cashregister", "Cash Register"),
+    ("classical", "Classical"),
+    ("cosmic", "Cosmic"),
+    ("falling", "Falling"),
+    ("gamelan", "Gamelan"),
+    ("incoming", "Incoming"),
+    ("intermission", "Intermission"),
+    ("magic", "Magic"),
+    ("mechanical", "Mechanical"),
+    ("pianobar", "Piano Bar"),
+    ("siren", "Siren"),
+    ("spacealarm", "Space Alarm"),
+    ("tugboat", "Tug Boat"),
+    ("alien", "Alien Alarm (lang)"),
+    ("climb", "Climb (lang)"),
+    ("persistent", "Persistent (lang)"),
+    ("echo", "Pushover Echo (lang)"),
+    ("updown", "Up Down (lang)"),
+];
+
+/// The display name of a sound code, or the code itself when it is not one of
+/// Pushover's own.
+pub fn sound_label(code: &str) -> &str {
+    PUSHOVER_SOUNDS
+        .iter()
+        .find(|(known, _)| *known == code)
+        .map_or(code, |(_, label)| label)
+}
+
 pub fn sound_cache_dir() -> PathBuf {
     crate::local_state::default_state_path()
         .parent()
@@ -46,6 +80,15 @@ pub fn playback_code(priority: i32, sound: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_listed_sound_is_a_safe_code() {
+        for (code, _) in PUSHOVER_SOUNDS {
+            assert_eq!(sanitize_sound_code(code), Some(code));
+        }
+        assert_eq!(sound_label("pianobar"), "Piano Bar");
+        assert_eq!(sound_label("custom1"), "custom1");
+    }
 
     #[test]
     fn quiet_priorities_and_none_stay_silent() {

@@ -57,6 +57,21 @@ pub struct LocalState {
     /// Palette wish. A missing key follows the OS appearance.
     #[serde(default)]
     pub theme: ThemeChoice,
+    /// Per priority: notify or not, and which sound. Missing keys behave like
+    /// Pushover itself.
+    #[serde(default)]
+    pub priority_rules: crate::priority_rules::PriorityRules,
+    /// Do not disturb: nightly window and manual pause.
+    #[serde(default)]
+    pub quiet: crate::quiet::QuietHours,
+    /// Look for a new release at start and every few hours, and install it
+    /// on the next start. Missing keys stay on.
+    #[serde(default = "auto_update_by_default")]
+    pub auto_update: bool,
+}
+
+fn auto_update_by_default() -> bool {
+    true
 }
 
 fn digest_threshold_by_default() -> u8 {
@@ -88,6 +103,9 @@ impl Default for LocalState {
             start_with_windows: false,
             digest_threshold: crate::sync::DEFAULT_DIGEST_THRESHOLD,
             theme: ThemeChoice::System,
+            priority_rules: Default::default(),
+            quiet: Default::default(),
+            auto_update: true,
         }
     }
 }
@@ -203,6 +221,9 @@ mod tests {
             start_with_windows: true,
             digest_threshold: 5,
             theme: ThemeChoice::Dark,
+            priority_rules: Default::default(),
+            quiet: Default::default(),
+            auto_update: false,
         };
         state.write(&path).unwrap();
         let loaded = LocalState::read(&path).unwrap();

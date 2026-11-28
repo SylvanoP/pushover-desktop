@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use crate::components::{
-    ButtonVariant, button, button_with, empty_state, field_group, icon_button, inline_action,
-    inline_action_with, link, message_line, section, segmented, setting_row, switch, tab,
+    ButtonVariant, PlayState, button, button_with, empty_state, equalizer, field_group,
+    icon_button, inline_action, inline_action_with, link, menu_item, menu_panel, message_line,
+    play_button, section, segmented, select_trigger, setting_row, switch, switch_locked, tab,
 };
 use crate::form_theme::{
     CONTROL_HEIGHT, FormTheme, LABEL_WIDTH, MessageKind, RADIUS_LG, RADIUS_MD, field_chrome, space,
@@ -17,18 +18,31 @@ use gpui::{
     Animation, AnimationExt, App, Bounds, ClipboardItem, ColorExt as _, Context, DispatchPhase,
     Entity, Focusable, Global, Hitbox, KeyDownEvent, MouseButton, MouseMoveEvent, Pixels, Point,
     SharedString, Subscription, SystemNotification, SystemNotificationAction, TitlebarOptions,
-    Window, WindowBounds, WindowHandle, WindowOptions, div, ease_out_quint, prelude::*,
-    pulsating_between, px, relative, rgb_to_hsla, size,
+    Window, WindowBounds, WindowHandle, WindowOptions, anchored, canvas, deferred, div,
+    ease_out_quint, point, prelude::*, pulsating_between, px, relative, rgb_to_hsla, size,
 };
 use gpui_ce_elements::editable_text::{
     EditableTextState, StringStorage, TextChanged,
-    actions::{DEFAULT_INPUT_CONTEXT, default_bindings},
+    actions::{self as edit_actions, DEFAULT_INPUT_CONTEXT, default_bindings},
     text_area, text_input,
 };
 use openover_core::{
-    CredentialStore, DEFAULT_DEVICE_NAME, LocalState, LoggedMessage, MAX_DIGEST_THRESHOLD,
-    ThemeChoice, Toast, clamp_digest_threshold, clamp_volume, validate_device_name,
+    CredentialStore, DEFAULT_DEVICE_NAME, DEFAULT_SOUND, LocalState, LoggedMessage,
+    MAX_DIGEST_THRESHOLD, PUSHOVER_SOUNDS, PriorityLevel, PriorityRules, QuietHours, QuietReason,
+    SoundChoice, ThemeChoice, Toast, clamp_digest_threshold, clamp_volume, format_minute,
+    sound_label, step_minute, validate_device_name,
 };
+
+/// How often a running app looks for a new release on its own.
+#[cfg(not(target_os = "macos"))]
+const UPDATE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+/// How often the header re-checks whether quiet hours began or ended. A minute
+/// is the finest step the window can be set in, so this never shows a stale state
+/// for long.
+const QUIET_TICK: Duration = Duration::from_secs(30);
+/// The pauses the tray and settings offer, in minutes.
+const PAUSE_CHOICES: [(u64, &str); 3] =
+    [(30, "30 Minuten"), (60, "1 Stunde"), (8 * 60, "8 Stunden")];
 
 /// How long "Kopiert" stays where the click happened.
 const COPIED_FEEDBACK: Duration = Duration::from_millis(1500);
@@ -119,7 +133,10 @@ pub struct Settings {
     sound_volume: u8,
     digest_threshold: u8,
     dragging_volume: bool,
-    volume_bounds: Option<Bounds<Pixels>>,
+    /// Where the slider track was last painted. The click lands on the whole
+    /// field, but the value maps onto the track alone, which sits inside the
+    /// field's padding and next to the number.
+    volume_track: std::rc::Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     messages: Vec<LoggedMessage>,
     search: Entity<EditableTextState>,
     confirm_clear: bool,
@@ -148,6 +165,22 @@ pub struct Settings {
     update_busy: bool,
     #[cfg(not(target_os = "macos"))]
     update_line: UpdateLine,
+    #[cfg(not(target_os = "macos"))]
+    auto_update: bool,
+    quiet: QuietHours,
+    /// Whether quiet hours held at the last tick, so the header only redraws
+    /// when that changes.
+    quiet_now: Option<QuietReason>,
+    priority_rules: PriorityRules,
+    /// The priority whose sound menu is open, if any.
+    sound_menu: Option<PriorityLevel>,
+    /// The one sound preview in flight, if any.
+    preview: Option<Preview>,
+    /// The sound whose last preview failed, so its button can offer a retry.
+    preview_failed: Option<String>,
+    /// Counts previews, so a late report from one that was already replaced
+    /// cannot reset the button of the one that replaced it.
+    preview_seq: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -189,7 +222,7 @@ impl Settings {
             sound_volume: clamp_volume(stored.sound_volume),
             digest_threshold: clamp_digest_threshold(stored.digest_threshold),
             dragging_volume: false,
-            volume_bounds: None,
+            volume_track: Default::default(),
             messages,
             search,
             confirm_clear: false,
@@ -213,6 +246,15 @@ impl Settings {
             update_busy: false,
             #[cfg(not(target_os = "macos"))]
             update_line: UpdateLine::Idle,
+            #[cfg(not(target_os = "macos"))]
+            auto_update: stored.auto_update,
+            quiet: stored.quiet.clone().normalized(),
+            quiet_now: None,
+            priority_rules: stored.priority_rules.clone().normalized(),
+            sound_menu: None,
+            preview: None,
+            preview_failed: None,
+            preview_seq: 0,
             _subscriptions: subscriptions,
         }
     }
@@ -316,6 +358,212 @@ impl Settings {
         cx.notify();
     }
 
+    fn set_priority_notify(&mut self, level: PriorityLevel, cx: &mut Context<Self>) {
+        if !level.can_mute() {
+            return;
+        }
+        let rule = self.priority_rules.get_mut(level);
+        rule.notify = !rule.notify;
+        self.persist_priority_rules(cx);
+        cx.notify();
+    }
+
+    fn set_priority_sound(
+        &mut self,
+        level: PriorityLevel,
+        choice: SoundChoice,
+        cx: &mut Context<Self>,
+    ) {
+        self.sound_menu = None;
+        if self.priority_rules.get(level).sound != choice {
+            self.priority_rules.get_mut(level).sound = choice;
+            self.persist_priority_rules(cx);
+        }
+        cx.notify();
+    }
+
+    fn toggle_sound_menu(&mut self, level: PriorityLevel, cx: &mut Context<Self>) {
+        self.sound_menu = if self.sound_menu == Some(level) {
+            None
+        } else {
+            Some(level)
+        };
+        cx.notify();
+    }
+
+    fn close_sound_menu(&mut self, cx: &mut Context<Self>) {
+        if self.sound_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn persist_priority_rules(&mut self, cx: &mut Context<Self>) {
+        self.priority_rules = self.priority_rules.clone().normalized();
+        let rules = self.priority_rules.clone();
+        let sent = cx.try_global::<SessionCommands>().is_some_and(|commands| {
+            commands
+                .0
+                .send(SessionCommand::SetPriorityRules {
+                    rules: rules.clone(),
+                })
+                .is_ok()
+        });
+        if sent {
+            return;
+        }
+        let mut state = LocalState::load();
+        state.priority_rules = rules;
+        if let Err(err) = state.save() {
+            tracing::warn!("could not store priority rules: {err}");
+        }
+    }
+
+    /// The state a preview button for `code` shows.
+    fn play_state(&self, code: Option<&str>) -> PlayState {
+        let Some(code) = code else {
+            return PlayState::Disabled;
+        };
+        match &self.preview {
+            Some(preview) if preview.code == code => {
+                if preview.playing {
+                    PlayState::Playing
+                } else {
+                    PlayState::Loading
+                }
+            }
+            _ if self.preview_failed.as_deref() == Some(code) => PlayState::Failed,
+            _ => PlayState::Idle,
+        }
+    }
+
+    /// One click handler for every preview button: it starts the sound, or
+    /// stops it when that very sound is already loading or playing. Starting a
+    /// different sound cuts off the one before, so a user can click through the
+    /// list as fast as they like.
+    fn toggle_preview(&mut self, code: String, cx: &mut Context<Self>) {
+        if self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.code == code)
+        {
+            self.stop_preview(cx);
+            return;
+        }
+        self.start_preview(code, cx);
+    }
+
+    fn stop_preview(&mut self, cx: &mut Context<Self>) {
+        if self.preview.take().is_some() {
+            crate::sound::stop();
+            cx.notify();
+        }
+    }
+
+    fn start_preview(&mut self, code: String, cx: &mut Context<Self>) {
+        let volume = self.sound_volume;
+        if volume == 0 {
+            self.notify_user(
+                "Lautstärke steht auf 0. Zum Anhören erst lauter stellen.",
+                MessageKind::Info,
+                cx,
+            );
+            return;
+        }
+        self.preview_seq += 1;
+        let seq = self.preview_seq;
+        self.preview_failed = None;
+        let cached = crate::sound::cached(&code);
+        let (tx, mut rx) = futures_channel::mpsc::unbounded::<PreviewStep>();
+        self.preview = Some(Preview {
+            code: code.clone(),
+            seq,
+            playing: cached.is_some(),
+            steps: tx.clone(),
+        });
+        cx.notify();
+        match cached {
+            Some(path) => crate::sound::preview(path, volume, ended_into(tx)),
+            None => {
+                crate::sound::stop();
+                let fetch = code.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("openover-sound-fetch".into())
+                    .spawn(move || {
+                        let step = match crate::sound::fetch(&fetch) {
+                            Ok(path) => PreviewStep::Downloaded(path),
+                            Err(err) => {
+                                tracing::warn!("sound preview {fetch}: {err}");
+                                PreviewStep::Ended(crate::sound::PlayEnd::Failed)
+                            }
+                        };
+                        let _ = tx.unbounded_send(step);
+                    });
+                if spawned.is_err() {
+                    self.preview = None;
+                    self.preview_failed = Some(code);
+                    self.notify_user("Vorschau konnte nicht starten.", MessageKind::Error, cx);
+                    return;
+                }
+            }
+        }
+
+        cx.spawn(async move |this, cx| {
+            while let Some(step) = rx.next().await {
+                let keep_going = this
+                    .update(cx, |this, cx| this.preview_step(seq, volume, step, cx))
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Applies one report about preview `seq`. Returns false once the preview
+    /// is over, or was replaced, so its listener can stop.
+    fn preview_step(
+        &mut self,
+        seq: u64,
+        volume: u8,
+        step: PreviewStep,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let current = self
+            .preview
+            .as_ref()
+            .is_some_and(|preview| preview.seq == seq);
+        match step {
+            PreviewStep::Downloaded(path) => {
+                let Some(preview) = self.preview.as_mut().filter(|_| current) else {
+                    return false;
+                };
+                preview.playing = true;
+                crate::sound::preview(path, volume, ended_into(preview.steps.clone()));
+                cx.notify();
+                true
+            }
+            PreviewStep::Ended(how) => {
+                if !current {
+                    return false;
+                }
+                let preview = self.preview.take();
+                if how == crate::sound::PlayEnd::Failed
+                    && let Some(preview) = preview
+                {
+                    self.preview_failed = Some(preview.code);
+                    self.notify_user(
+                        "Ton konnte nicht abgespielt werden. Verbindung prüfen und erneut versuchen.",
+                        MessageKind::Error,
+                        cx,
+                    );
+                }
+                cx.notify();
+                false
+            }
+        }
+    }
+
     fn persist_digest(&self, cx: &mut Context<Self>) {
         let threshold = self.digest_threshold;
         let sent = cx.try_global::<SessionCommands>().is_some_and(|commands| {
@@ -335,7 +583,7 @@ impl Settings {
     }
 
     fn apply_volume_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(bounds) = self.volume_bounds else {
+        let Some(bounds) = self.volume_track.get() else {
             return;
         };
         let volume = volume_from_bounds(bounds, position);
@@ -519,6 +767,12 @@ impl Settings {
                 self.notify_user(message, MessageKind::Error, cx);
                 crate::tray::set_tooltip_text(cx, Connection::SessionEnded.tooltip());
                 open_settings = true;
+            }
+            SessionEvent::LogChanged { epoch } => {
+                if !self.accept_epoch(epoch) {
+                    return false;
+                }
+                self.reload_messages();
             }
             SessionEvent::Activate => open_settings = true,
             SessionEvent::OpenMessage { id } => {
@@ -717,6 +971,7 @@ impl Settings {
             crate::update::CheckOutcome::Current => UpdateLine::Current,
             #[cfg(windows)]
             crate::update::CheckOutcome::Ready { version, path } => {
+                tracing::info!("update {version} is downloaded and verified");
                 UpdateLine::Ready { version, path }
             }
             crate::update::CheckOutcome::Failed(message) => {
@@ -724,6 +979,8 @@ impl Settings {
                 UpdateLine::Failed(message)
             }
         };
+        #[cfg(windows)]
+        self.install_ready_update_quietly(cx);
         cx.notify();
     }
 
@@ -739,6 +996,118 @@ impl Settings {
                 self.update_line = UpdateLine::Failed(message);
                 cx.notify();
             }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn toggle_auto_update(&mut self, cx: &mut Context<Self>) {
+        self.auto_update = !self.auto_update;
+        let mut state = LocalState::load();
+        state.auto_update = self.auto_update;
+        if let Err(err) = state.save() {
+            tracing::warn!("could not store auto update wish: {err}");
+        }
+        if self.auto_update {
+            self.start_update_check(cx);
+        }
+        cx.notify();
+    }
+
+    /// Installs a ready update on its own, but only while the window is
+    /// hidden: restarting under the user's hands would lose what they do.
+    #[cfg(windows)]
+    fn install_ready_update_quietly(&mut self, cx: &mut Context<Self>) {
+        if !self.auto_update || self.unread.window_visible() {
+            return;
+        }
+        if matches!(self.update_line, UpdateLine::Ready { .. }) {
+            tracing::info!("installing the downloaded update while the window is hidden");
+            self.restart_for_update(cx);
+        }
+    }
+
+    fn set_quiet(&mut self, quiet: QuietHours, cx: &mut Context<Self>) {
+        self.quiet = quiet.normalized();
+        let quiet = self.quiet.clone();
+        let sent = cx.try_global::<SessionCommands>().is_some_and(|commands| {
+            commands
+                .0
+                .send(SessionCommand::SetQuietHours {
+                    quiet: quiet.clone(),
+                })
+                .is_ok()
+        });
+        if !sent {
+            let mut state = LocalState::load();
+            state.quiet = quiet;
+            if let Err(err) = state.save() {
+                tracing::warn!("could not store quiet hours: {err}");
+            }
+        }
+        self.refresh_quiet(cx);
+        crate::tray::refresh_menu(cx);
+        cx.notify();
+    }
+
+    fn toggle_quiet_window(&mut self, cx: &mut Context<Self>) {
+        let mut quiet = self.quiet.clone();
+        quiet.enabled = !quiet.enabled;
+        self.set_quiet(quiet, cx);
+    }
+
+    fn step_quiet(&mut self, start: bool, steps: i32, cx: &mut Context<Self>) {
+        let mut quiet = self.quiet.clone();
+        if start {
+            quiet.start = step_minute(quiet.start, steps);
+        } else {
+            quiet.end = step_minute(quiet.end, steps);
+        }
+        self.set_quiet(quiet, cx);
+    }
+
+    pub fn pause_for(&mut self, minutes: u64, cx: &mut Context<Self>) {
+        let mut quiet = self.quiet.clone();
+        quiet.paused_until = Some(crate::clock::unix_now() + minutes * 60);
+        self.set_quiet(quiet, cx);
+        self.notify_user(
+            format!(
+                "Stumm bis {}. Notfälle kommen weiter durch.",
+                crate::clock::format_local_clock(quiet_until(&self.quiet))
+            ),
+            MessageKind::Info,
+            cx,
+        );
+    }
+
+    pub fn resume_now(&mut self, cx: &mut Context<Self>) {
+        let mut quiet = self.quiet.clone();
+        quiet.paused_until = None;
+        self.set_quiet(quiet, cx);
+    }
+
+    fn quiet_reason(&self) -> Option<QuietReason> {
+        self.quiet
+            .reason(crate::clock::unix_now(), crate::clock::minute_of_day_now())
+    }
+
+    /// Redraws the header when quiet hours start or end. A pause that ran out
+    /// is cleared from the stored state too, so it does not linger in the file.
+    fn refresh_quiet(&mut self, cx: &mut Context<Self>) {
+        let now = self.quiet_reason();
+        if self
+            .quiet
+            .paused_until
+            .is_some_and(|until| until <= crate::clock::unix_now())
+        {
+            let mut quiet = self.quiet.clone();
+            quiet.paused_until = None;
+            self.set_quiet(quiet, cx);
+            return;
+        }
+        if now != self.quiet_now {
+            self.quiet_now = now;
+            crate::tray::refresh_menu(cx);
+            cx.notify();
         }
     }
 
@@ -790,6 +1159,10 @@ impl Render for Settings {
             .id("openover-settings")
             .key_context("OpenoverSettings")
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.sound_menu.is_some() {
+                    this.close_sound_menu(cx);
+                    return;
+                }
                 if event.keystroke.key == "enter"
                     && !this.busy
                     && !this.logged_in
@@ -1108,26 +1481,40 @@ fn preferences_pane(
         .child(sound_row(settings, theme, cx))
         .child(digest_row(settings, theme, cx));
 
+    let priorities = PriorityLevel::ALL.iter().fold(
+        section("Nach Priorität", theme).child(priority_header(theme)),
+        |section, level| section.child(priority_row(*level, settings, theme, cx)),
+    );
+
     let device = section("Gerät", theme).child(setting_row(
         "Gerätename",
         device_name_value(device_name, theme),
-        Some("Wird im Konto-Tab geändert.".into()),
+        Some("Wird beim ersten Anmelden an Pushover übergeben.".into()),
         theme,
     ));
 
     let appearance = section("Darstellung", theme).child(theme_row(settings, theme, cx));
 
+    let quiet = section("Nicht stören", theme)
+        .child(quiet_window_row(settings, theme, cx))
+        .child(pause_row(settings, theme, cx));
+
     let system = section("System", theme);
     #[cfg(any(windows, target_os = "macos"))]
     let system = system.child(autostart_row(settings, theme, cx));
     #[cfg(not(target_os = "macos"))]
-    let system = system.child(update_row(settings, theme, cx));
+    let system = system
+        .child(update_row(settings, theme, cx))
+        .child(auto_update_row(settings, theme, cx));
+    let system = system.child(log_row(theme, cx));
 
     div()
         .flex()
         .flex_col()
         .gap(space(6))
         .child(notifications)
+        .child(priorities)
+        .child(quiet)
         .child(appearance)
         .child(device)
         .child(system)
@@ -1184,6 +1571,244 @@ fn sound_row(
         None,
         theme,
     )
+}
+
+/// Height the sound menu may take before it scrolls. Twenty-three entries do
+/// not fit a 680 px window, and a menu taller than the window would be clipped.
+const SOUND_MENU_MAX_HEIGHT: Pixels = px(280.);
+/// Width of the notify column, so the switches line up under their heading.
+const NOTIFY_COLUMN: Pixels = px(64.);
+
+fn priority_label(level: PriorityLevel) -> &'static str {
+    match level {
+        PriorityLevel::Low => "Niedrig",
+        PriorityLevel::Normal => "Normal",
+        PriorityLevel::High => "Hoch",
+        PriorityLevel::Emergency => "Notfall",
+    }
+}
+
+fn priority_key(level: PriorityLevel) -> &'static str {
+    match level {
+        PriorityLevel::Low => "low",
+        PriorityLevel::Normal => "normal",
+        PriorityLevel::High => "high",
+        PriorityLevel::Emergency => "emergency",
+    }
+}
+
+fn sound_choice_label(choice: &SoundChoice) -> String {
+    match choice {
+        SoundChoice::Sender => "Ton des Absenders".into(),
+        SoundChoice::Silent => "Stumm".into(),
+        SoundChoice::Named(code) => sound_label(code).to_string(),
+    }
+}
+
+/// The code a preview plays for this choice. "Sender" has no fixed sound, so it
+/// plays the one Pushover falls back to.
+fn preview_code(choice: &SoundChoice) -> Option<String> {
+    match choice {
+        SoundChoice::Sender => Some(DEFAULT_SOUND.to_string()),
+        SoundChoice::Silent => None,
+        SoundChoice::Named(code) => Some(code.clone()),
+    }
+}
+
+fn priority_header(theme: &FormTheme) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(space(3))
+        .text_xs()
+        .text_color(theme.quiet)
+        .child(div().w(LABEL_WIDTH).flex_shrink_0().child("Priorität"))
+        .child(div().w(NOTIFY_COLUMN).flex_shrink_0().child("Melden"))
+        .child(div().flex_1().child("Ton"))
+}
+
+fn priority_hint(text: &'static str, theme: &FormTheme) -> impl IntoElement {
+    div()
+        .pl(LABEL_WIDTH + space(3))
+        .text_xs()
+        .text_color(theme.quiet)
+        .child(text)
+}
+
+fn priority_row(
+    level: PriorityLevel,
+    settings: &Settings,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> impl IntoElement {
+    let rule = settings.priority_rules.get(level);
+    let key = priority_key(level);
+    let notify = rule.notify || !level.can_mute();
+    let notify_control = if level.can_mute() {
+        switch(
+            match level {
+                PriorityLevel::Low => "notify-low",
+                PriorityLevel::Normal => "notify-normal",
+                _ => "notify-high",
+            },
+            notify,
+            50 + level as isize,
+            theme,
+            cx.listener(move |this, _, _, cx| this.set_priority_notify(level, cx)),
+        )
+        .into_any_element()
+    } else {
+        switch_locked(true, theme).into_any_element()
+    };
+    let preview = preview_code(&rule.sound).filter(|_| notify);
+    let play_state = settings.play_state(preview.as_deref());
+    let open = settings.sound_menu == Some(level);
+
+    let trigger = select_trigger(
+        SharedString::from(format!("sound-{key}")),
+        sound_choice_label(&rule.sound),
+        open,
+        notify,
+        theme,
+    )
+    .when(notify, |trigger| {
+        trigger.on_click(cx.listener(move |this, _, _, cx| this.toggle_sound_menu(level, cx)))
+    });
+
+    let picker = div()
+        .relative()
+        .flex_1()
+        .min_w_0()
+        .child(trigger)
+        .when(open, |picker| {
+            picker.child(
+                deferred(
+                    anchored()
+                        .position_mode(gpui::AnchoredPositionMode::Local)
+                        .position(point(px(0.), CONTROL_HEIGHT + space(1)))
+                        .snap_to_window_with_margin(space(2))
+                        .child(sound_menu(level, &rule.sound, settings, theme, cx)),
+                )
+                .priority(1),
+            )
+        });
+
+    let play = play_button(
+        SharedString::from(format!("preview-{key}")),
+        play_state,
+        theme,
+    );
+    let play = match preview {
+        Some(code) => {
+            play.on_click(cx.listener(move |this, _, _, cx| this.toggle_preview(code.clone(), cx)))
+        }
+        None => play,
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(space(1))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(space(3))
+                .child(
+                    div()
+                        .w(LABEL_WIDTH)
+                        .flex_shrink_0()
+                        .text_color(theme.text)
+                        .child(priority_label(level)),
+                )
+                .child(div().w(NOTIFY_COLUMN).flex_shrink_0().child(notify_control))
+                .child(picker)
+                .child(play),
+        )
+        .when(!level.can_mute(), |row| {
+            row.child(priority_hint(
+                "Notfälle melden sich immer, bis sie bestätigt sind.",
+                theme,
+            ))
+        })
+        .when(level.can_mute() && !notify, |row| {
+            row.child(priority_hint(
+                "Landet still in der Nachrichtenliste.",
+                theme,
+            ))
+        })
+}
+
+fn sound_menu(
+    level: PriorityLevel,
+    current: &SoundChoice,
+    settings: &Settings,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> impl IntoElement {
+    let mut choices: Vec<SoundChoice> = Vec::with_capacity(PUSHOVER_SOUNDS.len() + 2);
+    if level.offers_sender_sound() {
+        choices.push(SoundChoice::Sender);
+    }
+    choices.push(SoundChoice::Silent);
+    choices.extend(
+        PUSHOVER_SOUNDS
+            .iter()
+            .map(|(code, _)| SoundChoice::Named((*code).to_string())),
+    );
+    let key = priority_key(level);
+    let panel = menu_panel(SharedString::from(format!("sound-menu-{key}")), theme)
+        .w(px(240.))
+        .max_h(SOUND_MENU_MAX_HEIGHT)
+        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_sound_menu(cx)));
+    choices
+        .into_iter()
+        .enumerate()
+        .fold(panel, |panel, (index, choice)| {
+            let selected = &choice == current;
+            let label = sound_choice_label(&choice);
+            let preview = match &choice {
+                SoundChoice::Named(code) => Some(code.clone()),
+                _ => None,
+            };
+            let playing = preview
+                .as_deref()
+                .is_some_and(|code| settings.play_state(Some(code)) == PlayState::Playing);
+            let item =
+                menu_item(
+                    SharedString::from(format!("sound-{key}-{index}")),
+                    label,
+                    selected,
+                    theme,
+                )
+                .when(playing, |item| item.child(equalizer(theme.accent)))
+                .flex_1()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_priority_sound(level, choice.clone(), cx)
+                }));
+            panel.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(space(1))
+                    .child(item)
+                    .when_some(preview, |line, code| {
+                        line.child(
+                            play_button(
+                                SharedString::from(format!("sound-{key}-{index}-play")),
+                                settings.play_state(Some(&code)),
+                                theme,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_preview(code.clone(), cx)
+                                },
+                            )),
+                        )
+                    }),
+            )
+        })
 }
 
 fn theme_row(
@@ -1343,6 +1968,200 @@ fn autostart_row(
     )
 }
 
+fn quiet_until(quiet: &QuietHours) -> u64 {
+    quiet.paused_until.unwrap_or_default()
+}
+
+/// A time of day with a step down and a step up, for one end of the window.
+fn minute_stepper(
+    id: &'static str,
+    minute: u16,
+    enabled: bool,
+    theme: &FormTheme,
+    on_step: impl Fn(i32, &mut Window, &mut App) + Clone + 'static,
+) -> impl IntoElement {
+    let down = on_step.clone();
+    div()
+        .flex()
+        .items_center()
+        .gap(space(1))
+        .child(icon_button(
+            SharedString::from(format!("{id}-earlier")),
+            icons::MINUS,
+            enabled,
+            theme,
+            move |_, window, cx| down(-1, window, cx),
+        ))
+        .child(
+            div()
+                .w(px(48.))
+                .flex()
+                .justify_center()
+                .text_color(if enabled {
+                    theme.text
+                } else {
+                    theme.placeholder
+                })
+                .child(format_minute(minute)),
+        )
+        .child(icon_button(
+            SharedString::from(format!("{id}-later")),
+            icons::PLUS,
+            enabled,
+            theme,
+            move |_, window, cx| on_step(1, window, cx),
+        ))
+}
+
+fn quiet_window_row(
+    settings: &Settings,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> impl IntoElement {
+    let quiet = &settings.quiet;
+    let enabled = quiet.enabled;
+    let view = cx.entity().downgrade();
+    let start_view = view.clone();
+    let hint = if !enabled {
+        "Aus. Benachrichtigungen kommen rund um die Uhr.".to_string()
+    } else if quiet.start == quiet.end {
+        "Beginn und Ende sind gleich, das Fenster ist leer.".to_string()
+    } else {
+        format!(
+            "Täglich {} bis {} nur Notfälle. Alles andere landet still in der Liste.",
+            format_minute(quiet.start),
+            format_minute(quiet.end)
+        )
+    };
+    setting_row(
+        "Ruhezeit",
+        div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap(space(3))
+            .child(switch(
+                "quiet-toggle",
+                enabled,
+                60,
+                theme,
+                cx.listener(|this, _, _, cx| this.toggle_quiet_window(cx)),
+            ))
+            .child(minute_stepper(
+                "quiet-start",
+                quiet.start,
+                enabled,
+                theme,
+                move |steps, _, cx| {
+                    let _ = start_view.update(cx, |this, cx| this.step_quiet(true, steps, cx));
+                },
+            ))
+            .child(div().text_color(theme.quiet).child("bis"))
+            .child(minute_stepper(
+                "quiet-end",
+                quiet.end,
+                enabled,
+                theme,
+                move |steps, _, cx| {
+                    let _ = view.update(cx, |this, cx| this.step_quiet(false, steps, cx));
+                },
+            )),
+        Some(hint.into()),
+        theme,
+    )
+}
+
+fn pause_row(
+    settings: &Settings,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> impl IntoElement {
+    let paused = settings
+        .quiet
+        .paused_until
+        .filter(|until| *until > crate::clock::unix_now());
+    let control = match paused {
+        Some(until) => div()
+            .flex()
+            .items_center()
+            .gap(space(3))
+            .child(div().text_color(theme.pending).child(format!(
+                "Stumm bis {}",
+                crate::clock::format_local_clock(until)
+            )))
+            .child(
+                inline_action(
+                    "pause-end",
+                    "Jetzt fortsetzen",
+                    ButtonVariant::Primary,
+                    theme,
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.resume_now(cx))),
+            ),
+        None => PAUSE_CHOICES.iter().fold(
+            div().flex().items_center().flex_wrap().gap(space(1)),
+            |row, (minutes, label)| {
+                let minutes = *minutes;
+                row.child(
+                    inline_action(
+                        SharedString::from(format!("pause-{minutes}")),
+                        *label,
+                        ButtonVariant::Secondary,
+                        theme,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.pause_for(minutes, cx))),
+                )
+            },
+        ),
+    };
+    setting_row(
+        "Pausieren",
+        control,
+        Some("Auch über das Tray-Menü. Notfälle kommen immer durch.".into()),
+        theme,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn auto_update_row(
+    settings: &Settings,
+    theme: &FormTheme,
+    cx: &mut Context<Settings>,
+) -> impl IntoElement {
+    setting_row(
+        "Automatisch",
+        switch(
+            "auto-update-toggle",
+            settings.auto_update,
+            34,
+            theme,
+            cx.listener(|this, _, _, cx| this.toggle_auto_update(cx)),
+        ),
+        Some(if settings.auto_update {
+            "Sucht beim Start und alle 6 Stunden. Ein Update wird geprüft geladen und installiert, sobald das Fenster zu ist.".into()
+        } else {
+            "Aus. Updates nur über \"Nach Updates suchen\".".into()
+        }),
+        theme,
+    )
+}
+
+fn log_row(theme: &FormTheme, cx: &mut Context<Settings>) -> impl IntoElement {
+    setting_row(
+        "Protokoll",
+        inline_action_with(
+            "open-logs",
+            "Ordner öffnen",
+            Some(icons::FOLDER),
+            ButtonVariant::Secondary,
+            theme,
+        )
+        .on_click(cx.listener(|_, _, _, cx| crate::logging::reveal(cx))),
+        Some("Letzte 7 Tage. Hilft bei Verbindungsproblemen und Abstürzen. Ohne Passwörter oder Schlüssel.".into()),
+        theme,
+    )
+}
+
 /// Stepper for the batch size from which a summary replaces single toasts.
 fn digest_row(
     settings: &Settings,
@@ -1405,15 +2224,24 @@ fn volume_slider(
 ) -> gpui::Stateful<gpui::Div> {
     let fraction = f32::from(settings.sound_volume) / 100.0;
     let view = cx.entity().downgrade();
+    let track = settings.volume_track.clone();
     field_chrome(div().id("sound-volume"), theme, settings.dragging_volume)
         .cursor_pointer()
         .gap(space(3))
         .child(
             div()
                 .flex_1()
+                .relative()
                 .h(px(3.))
                 .bg(theme.border)
-                .child(div().h(px(3.)).w(relative(fraction)).bg(theme.accent)),
+                .child(div().h(px(3.)).w(relative(fraction)).bg(theme.accent))
+                .child(
+                    canvas(move |bounds, _, _| track.set(Some(bounds)), |_, _, _, _| {})
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                ),
         )
         .child(
             div()
@@ -1438,10 +2266,8 @@ fn volume_slider(
                 let Some(view) = view.upgrade() else {
                     return;
                 };
-                let bounds = hitbox.bounds;
                 let position = event.position;
                 view.update(cx, |this, cx| {
-                    this.volume_bounds = Some(bounds);
                     this.dragging_volume = true;
                     this.apply_volume_at(position, cx);
                     cx.notify();
@@ -1616,6 +2442,7 @@ fn message_row(
                         .py(space(1))
                         .mx(px(-8.))
                         .rounded(RADIUS_MD)
+                        .bg(theme.idle)
                         .cursor_pointer()
                         .hover(|style| style.bg(theme.hover))
                         .active(|style| style.bg(theme.pressed))
@@ -1661,12 +2488,13 @@ fn message_row(
                                 .flex_shrink_0()
                                 .text_color(theme.quiet)
                                 .whitespace_nowrap()
-                                .child(format_local_time(message.time)),
+                                .child(crate::clock::format_local(message.time)),
                         ),
                 )
                 .child(details(
                     &Details {
                         id,
+                        title: message.title.clone(),
                         body: message_body(message),
                         clip: copy_text(message),
                         url,
@@ -1701,8 +2529,31 @@ fn content_height(children: &[Bounds<Pixels>]) -> Option<Pixels> {
 /// The vertical padding of the detail box, which the measurement has to add back.
 const DETAILS_PADDING: Pixels = px(12.);
 
+/// The sound preview in flight: which sound, and whether it is still
+/// downloading or already audible.
+struct Preview {
+    code: String,
+    seq: u64,
+    playing: bool,
+    /// Where the download thread and the audio worker report back.
+    steps: futures_channel::mpsc::UnboundedSender<PreviewStep>,
+}
+
+enum PreviewStep {
+    Downloaded(std::path::PathBuf),
+    Ended(crate::sound::PlayEnd),
+}
+
+/// Turns the audio worker's end report into a step for the preview listener.
+fn ended_into(steps: futures_channel::mpsc::UnboundedSender<PreviewStep>) -> crate::sound::OnEnd {
+    Box::new(move |how| {
+        let _ = steps.unbounded_send(PreviewStep::Ended(how));
+    })
+}
+
 struct Details<'a> {
     id: u64,
+    title: String,
     body: String,
     clip: String,
     url: Option<String>,
@@ -1728,6 +2579,7 @@ fn details(
 ) -> gpui::Stateful<gpui::Div> {
     let Details {
         id,
+        title,
         body,
         clip,
         url,
@@ -1777,6 +2629,9 @@ fn details(
             .pt(space(2))
             .pb(space(1))
             .whitespace_normal()
+            .when(!title.trim().is_empty(), |block| {
+                block.child(selectable_title(id, title, theme, window, cx))
+            })
             .when(!body.is_empty(), |block| {
                 block.child(selectable_body(id, body, theme, window, cx))
             })
@@ -1852,9 +2707,68 @@ fn message_body(message: &LoggedMessage) -> String {
     message.text.clone()
 }
 
-/// The body as a read-only editor, so the text can be selected and copied by hand.
-/// `use_keyed_init` seeds it once; a later edit of the same message never happens
-/// because the log is append-only.
+/// Text the user can select with the mouse and copy with Ctrl+C, but not change.
+///
+/// Built on the editor rather than plain text, because plain text has no
+/// selection. The editor's own read-only switch is no use here: in this
+/// version it also drops the mouse handling, so nothing could be selected.
+/// The field therefore accepts input, and any edit that gets through is put
+/// back in the same update, before a frame can show it. Every editing
+/// command is swallowed before it reaches the editor; only typed characters
+/// get that far, and those are what the reset is for.
+fn selectable_text(
+    key: SharedString,
+    text: &str,
+    window: &mut Window,
+    cx: &mut Context<Settings>,
+) -> gpui_ce_elements::editable_text::EditableTextElement {
+    let seed = text.to_string();
+    let state = EditableTextState::use_keyed_init(key.clone(), window, cx, move |_, cx| {
+        let original = seed.clone();
+        cx.subscribe_self(move |state: &mut EditableTextState, _: &TextChanged, cx| {
+            if state.as_str() != original {
+                state.emplace(&original, cx);
+            }
+        })
+        .detach();
+        StringStorage::from(seed.as_str())
+    });
+    text_area(key)
+        .state(state.downgrade())
+        .w_full()
+        .cursor_text()
+        .caret_w(px(0.))
+        .capture_action(|_: &edit_actions::Tab, window, cx| {
+            cx.stop_propagation();
+            window.focus_next(cx);
+        })
+        .capture_action(|_: &edit_actions::Enter, _, cx| cx.stop_propagation())
+        .capture_action(|_: &edit_actions::DeleteLeft, _, cx| cx.stop_propagation())
+        .capture_action(|_: &edit_actions::DeleteRight, _, cx| cx.stop_propagation())
+        .capture_action(|_: &edit_actions::DeleteWordLeft, _, cx| cx.stop_propagation())
+        .capture_action(|_: &edit_actions::DeleteWordRight, _, cx| cx.stop_propagation())
+        .capture_action(|_: &edit_actions::DeleteToLineStart, _, cx| cx.stop_propagation())
+        .capture_action(|_: &edit_actions::DeleteToLineEnd, _, cx| cx.stop_propagation())
+        .capture_action(|_: &edit_actions::Cut, _, cx| cx.stop_propagation())
+        .capture_action(|_: &edit_actions::Paste, _, cx| cx.stop_propagation())
+        .capture_action(|_: &edit_actions::Undo, _, cx| cx.stop_propagation())
+        .capture_action(|_: &edit_actions::Redo, _, cx| cx.stop_propagation())
+}
+
+fn selectable_title(
+    id: u64,
+    title: &str,
+    theme: &FormTheme,
+    window: &mut Window,
+    cx: &mut Context<Settings>,
+) -> impl IntoElement {
+    selectable_text(SharedString::from(format!("title-{id}")), title, window, cx)
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_sm()
+        .text_color(theme.text)
+        .selection_color(theme.selection)
+}
+
 fn selectable_body(
     id: u64,
     body: &str,
@@ -1862,20 +2776,10 @@ fn selectable_body(
     window: &mut Window,
     cx: &mut Context<Settings>,
 ) -> impl IntoElement {
-    let element_id = SharedString::from(format!("body-{id}"));
-    let seed = body.to_string();
-    let state = EditableTextState::use_keyed_init(element_id.clone(), window, cx, move |_, _| {
-        StringStorage::from(seed.as_str())
-    });
-    text_area(element_id)
-        .state(state.downgrade())
-        .accepts_input(false)
-        .w_full()
-        .cursor_text()
+    selectable_text(SharedString::from(format!("body-{id}")), body, window, cx)
         .text_sm()
         .text_color(theme.text)
         .selection_color(theme.selection)
-        .caret_w(px(0.))
 }
 
 /// What the clipboard gets: title, text, and the link, each on its own line.
@@ -2093,13 +2997,6 @@ fn top_bar(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settings>) -
         .border_b_1()
         .border_color(theme.border)
         .child(
-            div()
-                .pr(space(2))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme.text)
-                .child("Openover"),
-        )
-        .child(
             tab(
                 "tab-messages",
                 "Nachrichten",
@@ -2146,13 +3043,40 @@ fn top_bar(settings: &Settings, theme: &FormTheme, cx: &mut Context<Settings>) -
         .child(
             div()
                 .flex()
+                .flex_shrink_0()
                 .items_center()
                 .gap(space(2))
+                .pl(space(3))
+                .whitespace_nowrap()
                 .text_xs()
                 .text_color(theme.quiet)
+                .when_some(settings.quiet_now, |status, reason| {
+                    status.child(quiet_badge(reason, theme))
+                })
                 .child(connection_dot(settings.connection, theme))
                 .child(settings.connection.label()),
         )
+}
+
+/// "Stumm" in the header while do not disturb holds, so muted notifications
+/// never look like a broken connection.
+fn quiet_badge(reason: QuietReason, theme: &FormTheme) -> impl IntoElement {
+    let until = match reason {
+        QuietReason::Paused(until) => crate::clock::format_local_clock(until),
+        QuietReason::Window { until_minute } => format_minute(until_minute),
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap(space(1))
+        .mr(space(2))
+        .px(space(2))
+        .h(px(20.))
+        .rounded_full()
+        .bg(theme.accent_soft)
+        .text_color(theme.accent)
+        .child(crate::icons::icon(icons::VOLUME_OFF, px(12.), theme.accent))
+        .child(format!("Stumm bis {until}"))
 }
 
 fn account_links(theme: &FormTheme) -> impl IntoElement {
@@ -2441,8 +3365,46 @@ pub fn install(cx: &mut App, background: bool) {
     } else {
         crate::tray::set_tooltip_text(cx, Connection::SignedOut.tooltip());
     }
+    #[cfg(windows)]
+    crate::update::discard_stale_download();
+    #[cfg(windows)]
+    if let Some((version, path)) = crate::update::staged_update()
+        && LocalState::load().auto_update
+    {
+        tracing::info!("installing update {version}, downloaded during the last session");
+        settings.update(cx, |this, cx| {
+            this.update_line = UpdateLine::Ready { version, path };
+            this.restart_for_update(cx);
+        });
+        return;
+    }
     #[cfg(not(target_os = "macos"))]
-    settings.update(cx, |this, cx| this.start_update_check(cx));
+    if LocalState::load().auto_update {
+        settings.update(cx, |this, cx| this.start_update_check(cx));
+    }
+    #[cfg(not(target_os = "macos"))]
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(UPDATE_EVERY).await;
+            cx.update(|cx| {
+                settings_entity(cx).update(cx, |this, cx| {
+                    if this.auto_update {
+                        this.start_update_check(cx);
+                    }
+                });
+            });
+        }
+    })
+    .detach();
+    cx.spawn(async move |cx| {
+        loop {
+            cx.update(|cx| {
+                settings_entity(cx).update(cx, |this, cx| this.refresh_quiet(cx));
+            });
+            cx.background_executor().timer(QUIET_TICK).await;
+        }
+    })
+    .detach();
     if !background || !has_session {
         open_settings_window(cx);
     }
@@ -2535,7 +3497,32 @@ pub fn open_settings_window_with_token(token: Option<&str>, cx: &mut App) {
 }
 
 fn mark_window(event: DotEvent, cx: &mut App) {
-    settings_entity(cx).update(cx, |settings, cx| settings.note_dot(event, cx));
+    settings_entity(cx).update(cx, |settings, cx| {
+        settings.note_dot(event, cx);
+        #[cfg(windows)]
+        if event == DotEvent::Hidden {
+            settings.install_ready_update_quietly(cx);
+        }
+    });
+}
+
+/// Whether do not disturb holds right now, for the tray menu.
+pub fn quiet_state(cx: &mut App) -> (Option<QuietReason>, bool) {
+    let settings = settings_entity(cx);
+    let settings = settings.read(cx);
+    (settings.quiet_reason(), settings.quiet.enabled)
+}
+
+pub fn pause_for(minutes: u64, cx: &mut App) {
+    settings_entity(cx).update(cx, |settings, cx| settings.pause_for(minutes, cx));
+}
+
+pub fn resume_now(cx: &mut App) {
+    settings_entity(cx).update(cx, |settings, cx| settings.resume_now(cx));
+}
+
+pub fn toggle_quiet_window(cx: &mut App) {
+    settings_entity(cx).update(cx, |settings, cx| settings.toggle_quiet_window(cx));
 }
 
 fn reveal(window: &mut Window, token: Option<&str>) {
@@ -2574,75 +3561,6 @@ fn volume_from_bounds(bounds: Bounds<Pixels>, position: Point<Pixels>) -> u8 {
     let x = (position.x - bounds.origin.x).as_f32();
     let ratio = (x / width).clamp(0.0, 1.0);
     (ratio * 100.0).round().clamp(0.0, 100.0) as u8
-}
-
-fn format_local_time(unix: u64) -> String {
-    #[cfg(windows)]
-    if let Some(formatted) = windows_local_time(unix) {
-        return formatted;
-    }
-    unix.to_string()
-}
-
-#[cfg(windows)]
-fn windows_local_time(unix: u64) -> Option<String> {
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct FileTime {
-        low: u32,
-        high: u32,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct SystemTime {
-        year: u16,
-        month: u16,
-        day_of_week: u16,
-        day: u16,
-        hour: u16,
-        minute: u16,
-        second: u16,
-        milliseconds: u16,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn FileTimeToSystemTime(file: *const FileTime, system: *mut SystemTime) -> i32;
-        fn SystemTimeToTzSpecificLocalTime(
-            zone: *const core::ffi::c_void,
-            utc: *const SystemTime,
-            local: *mut SystemTime,
-        ) -> i32;
-    }
-    let ticks = unix
-        .saturating_add(11_644_473_600)
-        .saturating_mul(10_000_000);
-    let file = FileTime {
-        low: ticks as u32,
-        high: (ticks >> 32) as u32,
-    };
-    let mut utc = SystemTime {
-        year: 0,
-        month: 0,
-        day_of_week: 0,
-        day: 0,
-        hour: 0,
-        minute: 0,
-        second: 0,
-        milliseconds: 0,
-    };
-    let mut local = utc;
-    unsafe {
-        if FileTimeToSystemTime(&file, &mut utc) == 0 {
-            return None;
-        }
-        if SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) == 0 {
-            return None;
-        }
-    }
-    Some(format!(
-        "{:02}.{:02}.{:04} {:02}:{:02}",
-        local.day, local.month, local.year, local.hour, local.minute
-    ))
 }
 
 #[cfg(test)]

@@ -37,6 +37,11 @@ impl UnreadDot {
         self.pending
     }
 
+    #[cfg(windows)]
+    pub const fn window_visible(&self) -> bool {
+        self.window_visible
+    }
+
     /// True while the row arrived unseen and the window has not been opened since.
     pub fn is_fresh(&self, id: u64) -> bool {
         self.fresh.contains(&id)

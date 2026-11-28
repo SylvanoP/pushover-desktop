@@ -3,7 +3,7 @@
 //! Everything visible reads its values from here, so that a change to a token
 //! moves the whole window at once instead of one call site at a time.
 
-use gpui::{Hsla, Pixels, Rgba, Styled, Window, WindowAppearance, hsla, px, rgb};
+use gpui::{Hsla, Pixels, Rgba, Styled, Window, WindowAppearance, hsla, px, rgb, rgba};
 use openover_core::ThemeChoice;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -99,6 +99,10 @@ pub struct FormTheme {
     pub border_hover: Rgba,
     /// Fill of a quiet control under the pointer.
     pub hover: Rgba,
+    /// Resting fill of a quiet control: the hover colour at zero alpha. A
+    /// control without any fill transitions from transparent black, which a
+    /// light surface shows as a dark flash on every hover.
+    pub idle: Rgba,
     /// Fill of a quiet control being pressed.
     pub pressed: Rgba,
     pub accent: Rgba,
@@ -149,6 +153,7 @@ impl FormTheme {
             border: rgb(0xe4e4e7),
             border_hover: rgb(0xd4d4d8),
             hover: rgb(0xf4f4f5),
+            idle: rgba(0xf4f4f500),
             pressed: rgb(0xe4e4e7),
             accent: rgb(0x2563eb),
             accent_hover: rgb(0x1d4ed8),
@@ -177,6 +182,7 @@ impl FormTheme {
             border: rgb(0x27272a),
             border_hover: rgb(0x3f3f46),
             hover: rgb(0x1f1f23),
+            idle: rgba(0x1f1f2300),
             pressed: rgb(0x27272a),
             accent: rgb(0x60a5fa),
             accent_hover: rgb(0x93c5fd),

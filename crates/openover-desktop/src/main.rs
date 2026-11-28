@@ -1,10 +1,12 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod clock;
 mod components;
 mod form_theme;
 mod icon;
 mod icons;
 mod instance;
+mod logging;
 #[cfg(any(windows, target_os = "macos"))]
 mod network;
 mod notify;
@@ -24,7 +26,6 @@ extern crate gpui_ce_backend as gpui;
 use clap::Parser;
 use gpui::{App, QuitMode, SystemNotification};
 use gpui_platform::application;
-use tracing_subscriber::EnvFilter;
 
 const DEMO_NOTIFICATION_TAG: &str = "openover-demo";
 
@@ -50,11 +51,7 @@ struct Cli {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive("openover_desktop=info".parse().unwrap()),
-        )
-        .init();
+    logging::init();
 
     let cli = Cli::parse();
     if !instance::claim_primary() {
@@ -106,32 +103,9 @@ fn play_sound_code(code: &str, wait: bool) {
     let code = code.to_string();
     let volume = openover_core::clamp_volume(openover_core::LocalState::load().sound_volume);
     let run = move || {
-        if volume == 0 {
-            tracing::info!("sound {code} stays silent because volume is 0");
-            return;
+        if let Err(err) = sound::fetch_and_play(&code, volume, wait) {
+            tracing::warn!("could not play sound {code}: {err}");
         }
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build();
-        let Ok(runtime) = runtime else {
-            return;
-        };
-        runtime.block_on(async move {
-            let Ok(client) = openover_core::PushoverClient::new() else {
-                return;
-            };
-            match client.cache_sound(&code).await {
-                Ok(path) => {
-                    tracing::info!("playing sound {code} at volume {volume}");
-                    if wait {
-                        sound::play_and_wait(path, volume);
-                    } else {
-                        sound::play(path, volume);
-                    }
-                }
-                Err(err) => tracing::warn!("could not play sound {code}: {err}"),
-            }
-        });
     };
     if wait {
         run();

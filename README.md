@@ -6,12 +6,12 @@
 
 **Lizenz für den Dienst:** Für Open-Client-Geräte ist eine [Pushover-Desktop-Lizenz](https://pushover.net/clients/desktop) erforderlich (30-Tage-Test, danach einmalig ~5 USD). Kauf und Account nur über [pushover.net](https://pushover.net/).
 
-**Download** aus dem Release [v0.1.3](https://github.com/SylvanoP/pushover-desktop/releases/tag/v0.1.3):
+**Download:**
 
-- Windows x64: [openover-desktop-windows-x64.exe](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.3/openover-desktop-windows-x64.exe)
-- macOS: [openover-desktop-macos.zip](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.3/openover-desktop-macos.zip). Das Zip enthält `Openover.app` im Wurzelverzeichnis. Die App ist ad hoc signiert und nicht notarisiert. Beim ersten Öffnen: Rechtsklick, dann „Öffnen“.
+- Windows x64 aus [v0.1.5](https://github.com/SylvanoP/pushover-desktop/releases/tag/v0.1.5): [openover-desktop-windows-x64.exe](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.5/openover-desktop-windows-x64.exe). Die App aktualisiert sich danach selbst.
+- macOS aus [v0.1.3](https://github.com/SylvanoP/pushover-desktop/releases/tag/v0.1.3): [openover-desktop-macos.zip](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.3/openover-desktop-macos.zip). Das Zip enthält `Openover.app` im Wurzelverzeichnis. Die App ist ad hoc signiert und nicht notarisiert. Beim ersten Öffnen: Rechtsklick, dann „Öffnen“.
 
-**English (short):** Unofficial Pushover **Open Client** (`os=O`). Not affiliated with Pushover LLC. The app does not use the Pushover logo and is not named “Pushover for …”. The [v0.1.3 release](https://github.com/SylvanoP/pushover-desktop/releases/tag/v0.1.3) has two files: Windows x64 [openover-desktop-windows-x64.exe](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.3/openover-desktop-windows-x64.exe), and macOS [openover-desktop-macos.zip](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.3/openover-desktop-macos.zip), a zip of `Openover.app`. The Mac app is ad-hoc signed and not notarized, so the first open is right-click, then Open. A Pushover desktop license is required. The source is MIT-licensed.
+**English (short):** Unofficial Pushover **Open Client** (`os=O`). Not affiliated with Pushover LLC. The app does not use the Pushover logo and is not named “Pushover for …”. Windows x64: [openover-desktop-windows-x64.exe](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.5/openover-desktop-windows-x64.exe) from [v0.1.5](https://github.com/SylvanoP/pushover-desktop/releases/tag/v0.1.5), which updates itself from then on. macOS: [openover-desktop-macos.zip](https://github.com/SylvanoP/pushover-desktop/releases/download/v0.1.3/openover-desktop-macos.zip), a zip of `Openover.app`. The Mac app is ad-hoc signed and not notarized, so the first open is right-click, then Open. A Pushover desktop license is required. The source is MIT-licensed.
 
 ## Status
 

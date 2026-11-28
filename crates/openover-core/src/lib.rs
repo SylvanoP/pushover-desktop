@@ -8,6 +8,8 @@ mod health;
 mod local_state;
 mod message_log;
 mod password_mask;
+mod priority_rules;
+mod quiet;
 mod sound;
 mod sync;
 mod types;
@@ -33,7 +35,14 @@ pub use message_log::{
 pub use password_mask::{
     MAX_PASSWORD_CHARS, PASSWORD_BULLET, apply_masked_replace, mask_password, wipe_secret,
 };
-pub use sound::{playback_code, sanitize_sound_code, sound_cache_dir};
+pub use priority_rules::{PriorityLevel, PriorityRule, PriorityRules, SoundChoice};
+pub use quiet::{
+    MINUTES_PER_DAY, QUIET_STEP_MINUTES, QuietHours, QuietReason, format_minute, step_minute,
+};
+pub use sound::{
+    DEFAULT_SOUND, PUSHOVER_SOUNDS, playback_code, sanitize_sound_code, sound_cache_dir,
+    sound_label,
+};
 pub use sync::{
     DEFAULT_DIGEST_THRESHOLD, Delivery, MAX_DIGEST_THRESHOLD, STALE_BACKLOG_LIMIT, SyncPlan, Toast,
     clamp_digest_threshold, cursor_after_delete, digest_summary, plan_sync, split_for_delivery,
